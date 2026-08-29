@@ -440,7 +440,9 @@ struct TextFormatBar: View {
             return live
         }()
         let size = CGFloat(card.fontSize ?? 16)
-        let ink = NSColor.vasa(hex: card.color ?? "#111318")
+        // Fall back to the *current appearance's* ink — a hardcoded light-mode hex here
+        // baked black text into the storage while on the dark canvas.
+        let ink = card.color.map { NSColor.vasa(hex: $0) } ?? Theme.defaultInkNSColor(scheme)
         let base: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: size, weight: .regular),
             .foregroundColor: ink
@@ -470,7 +472,7 @@ struct TextFormatBar: View {
                 html: card.html,
                 plain: card.body ?? card.html,
                 size: size,
-                ink: NSColor.vasa(hex: card.color ?? "#111318")
+                ink: card.color.map { NSColor.vasa(hex: $0) } ?? Theme.defaultInkNSColor(scheme)
             )
             let hug = CanvasTextEditor.hugSize(for: attr)
             app.updateCard(card.id, persist: false) {

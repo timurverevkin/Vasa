@@ -92,6 +92,30 @@ enum Theme {
         NSColor.vasa(hex: defaultInkHex(scheme))
     }
 
+    /// True when `color` reads as plain body text — near-black or near-white — rather
+    /// than a colour the user deliberately picked, and so must follow the current
+    /// appearance instead of being preserved.
+    ///
+    /// Deliberately measured, not matched against a list of known ink hexes: Cocoa's
+    /// HTML serializer converts colour spaces, so text saved as `#111318` comes back
+    /// as `#0E0F13` and an exact-match test silently stops firing — which left text
+    /// typed in one appearance unreadable in the other.
+    ///
+    /// The saturation guard keeps genuinely dark *colours* (a navy, say) intact; only
+    /// near-neutral extremes adapt. Thresholds verified against `itemColors`: the
+    /// darkest saturated swatch sits at luminance 0.14, and mid-grey `#8E8E93` at 0.27.
+    static func isAdaptiveInk(_ color: NSColor) -> Bool {
+        guard let rgb = color.usingColorSpace(.sRGB) else { return false }
+        func linear(_ c: CGFloat) -> CGFloat {
+            c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        let luminance = 0.2126 * linear(rgb.redComponent)
+            + 0.7152 * linear(rgb.greenComponent)
+            + 0.0722 * linear(rgb.blueComponent)
+        guard rgb.saturationComponent < 0.45 else { return false }
+        return luminance < 0.05 || luminance > 0.75
+    }
+
     static func color(_ hex: String?) -> Color {
         guard let hex else { return ink }
         var h = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
