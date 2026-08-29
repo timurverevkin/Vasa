@@ -10,6 +10,7 @@ A native macOS infinite canvas for notes, images, links, and video — one quiet
 [![macOS](https://img.shields.io/badge/macOS-14%2B-000000?style=flat-square&logo=apple&logoColor=white)](macos/Vasa/Vasa.xcodeproj)
 [![Swift](https://img.shields.io/badge/Swift-6-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![Download](https://img.shields.io/badge/Download-DMG-brightgreen?style=flat-square)](https://github.com/timurverevkin/Vasa/releases/download/v0.2.0/Vasa-0.2.0-arm64-native.dmg)
 
 </div>
 
@@ -86,7 +87,9 @@ One canvas, one file format, no login. Text, notes, images, links, audio, video,
 
 ### I just want to try the app
 
-Build the Release `.dmg` from source (there's no signed release yet):
+Download the latest `.dmg` from [Releases](https://github.com/timurverevkin/Vasa/releases) (macOS 14+, Apple Silicon).
+
+Or build it yourself:
 
 ```bash
 ./scripts/build-native-macos.sh          # current machine's arch
