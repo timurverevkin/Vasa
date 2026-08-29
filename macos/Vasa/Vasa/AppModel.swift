@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Foundation
 import Observation
+import SwiftUI
 import UniformTypeIdentifiers
 
 @Observable
@@ -168,6 +169,7 @@ final class AppModel {
             Playback.shared.stop()
         }
         AppSounds.isEnabled = { [weak self] in self?.settings.sounds ?? false }
+        AppHaptics.isEnabled = { [weak self] in self?.settings.haptics ?? false }
         ChatKeychain.migrateLegacyDeepSeekTokenIfNeeded()
     }
 
@@ -320,9 +322,12 @@ final class AppModel {
     }
 
     func toggleSidebar() {
-        library.sidebarOpen.toggle()
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+            library.sidebarOpen.toggle()
+            if !library.sidebarOpen { settingsOpen = false }
+        }
         AppSounds.play(library.sidebarOpen ? .transitionUp : .transitionDown)
-        if !library.sidebarOpen { settingsOpen = false }
+        AppHaptics.perform(.generic)
         indexDirty = true
         persistSoon()
     }
@@ -963,6 +968,10 @@ final class AppModel {
             guides = []
         }
 
+        if guides.isEmpty != snapGuides.isEmpty, !guides.isEmpty {
+            AppHaptics.perform(.alignment)
+        }
+
         let fx = dx + adjX
         let fy = dy + adjY
         guard fx != 0 || fy != 0 else {
@@ -1055,6 +1064,10 @@ final class AppModel {
             }
         } else if !snapGuides.isEmpty {
             guides = []
+        }
+
+        if guides.isEmpty != snapGuides.isEmpty, !guides.isEmpty {
+            AppHaptics.perform(.alignment)
         }
 
         patchLesson { lesson in
@@ -1598,8 +1611,12 @@ final class AppModel {
         }
         guard let session = cardResizeSession, session.id == id else { return }
 
-        let minW: Double = card.kind == .note ? 220 : (card.kind == .text ? 64 : 64)
-        let minH: Double = card.kind == .note ? 100 : (card.kind == .text ? 28 : 64)
+        // Shortcut/folder tiles have a fixed 58pt icon + padding — below ~104×120
+        // the icon and title clip against the card's rounded-rect mask.
+        let isShortcutTile = card.kind == .shortcut || card.kind == .folder
+        let minW: Double = card.kind == .note ? 220 : (card.kind == .text ? 64 : (isShortcutTile ? 104 : 64))
+        // A bit taller still (136) so the "Not found" state doesn't clip either.
+        let minH: Double = card.kind == .note ? 100 : (card.kind == .text ? 28 : (isShortcutTile ? 136 : 64))
         let maxW: Double = card.kind == .note ? 420 : 2400
         let maxH: Double = card.kind == .note ? 160 : 2400
         // Keep the raw corner — clamping before scale made a horizontal drag
@@ -2940,13 +2957,30 @@ final class AppModel {
     }
 
     func insertBlankNote() {
-        var card = DemoLibrary.base(VasaID.make("c"), .note, lastWorld.x, lastWorld.y, Format.notePreview.width, Format.notePreview.height, 1)
+        let size = Format.notePreview
+        let origin = freeOrigin(near: CGPoint(x: lastWorld.x, y: lastWorld.y), size: size)
+        var card = DemoLibrary.base(VasaID.make("c"), .note, origin.x, origin.y, size.width, size.height, 1)
         card.title = "Note"
         card.body = ""
         addCard(card)
         AppSounds.play(.pasteBlock)
         openNoteEditor(card.id)
         select([card.id])
+    }
+
+    /// Nudges a placement point diagonally, cascade-style, until the resulting frame
+    /// clears every existing card — so a note/paste dropped at a stale `lastWorld`
+    /// (e.g. still sitting over the last-clicked card) doesn't silently stack on top of it.
+    func freeOrigin(near point: CGPoint, size: CGSize, step: CGFloat = 24, maxTries: Int = 24) -> CGPoint {
+        guard let cards = activeLesson?.cards, !cards.isEmpty else { return point }
+        var candidate = point
+        for _ in 0..<maxTries {
+            let frame = CGRect(x: candidate.x, y: candidate.y, width: size.width, height: size.height)
+            if !cards.contains(where: { $0.frame.intersects(frame) }) { return candidate }
+            candidate.x += step
+            candidate.y += step
+        }
+        return candidate
     }
 
     func openContextMenu(at point: CGPoint, in size: CGSize) -> Bool {
@@ -3421,7 +3455,21 @@ final class AppModel {
             guard let dest = importIntoActiveLesson(url) else { return }
             let title = url.deletingPathExtension().lastPathComponent
             Task {
-                var card = DemoLibrary.video(VasaID.make("c"), x, y, 320, 200, 1, "", title)
+                // Card defaulted to a fixed 320×200 regardless of the source's real
+                // aspect — a square (or portrait) clip then rendered inside a wide
+                // rectangle, aspect-filled and cropped down to a sliver. Size the
+                // card from the video's actual (rotation-corrected) dimensions instead.
+                var pixel = CGSize(width: 320, height: 200)
+                if let track = try? await AVURLAsset(url: dest).loadTracks(withMediaType: .video).first,
+                   let natural = try? await track.load(.naturalSize),
+                   let transform = try? await track.load(.preferredTransform)
+                {
+                    let oriented = natural.applying(transform)
+                    let w = abs(oriented.width), h = abs(oriented.height)
+                    if w > 0, h > 0 { pixel = CGSize(width: w, height: h) }
+                }
+                let fitted = ImageMedia.cardSize(for: pixel, maxSide: 420)
+                var card = DemoLibrary.video(VasaID.make("c"), x, y, fitted.width, fitted.height, 1, "", title)
                 card.src = dest.absoluteString
                 if let poster = await Playback.generatePoster(for: dest) {
                     card.poster = poster.absoluteString
@@ -3622,7 +3670,10 @@ final class AppModel {
             pixel = CGSize(width: 360, height: 240)
         }
         let fitted = ImageMedia.cardSize(for: pixel)
-        addCard(DemoLibrary.image(VasaID.make("c"), x, y, fitted.width, fitted.height, 1, src, alt))
+        // Callers pass the pointer/drop point — center the card under it rather
+        // than anchoring its top-left corner there.
+        let origin = CGPoint(x: x - fitted.width / 2, y: y - fitted.height / 2)
+        addCard(DemoLibrary.image(VasaID.make("c"), origin.x, origin.y, fitted.width, fitted.height, 1, src, alt))
         AppSounds.play(.pasteBlock)
     }
 

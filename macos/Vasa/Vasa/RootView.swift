@@ -9,6 +9,22 @@ struct RootView: View {
     // menu never clamps against a guessed size and momentarily overflows the window.
     @State private var boardMenuSize: CGSize?
 
+    // Chip retreats fast on open (out of the sidebar's way); sidebar springs in
+    // right behind it, native-HIG feel. On close the sidebar snaps back first,
+    // then the chip settles in a beat later.
+    private static let chipTransition: AnyTransition = .asymmetric(
+        insertion: .move(edge: .leading).combined(with: .opacity)
+            .animation(.spring(response: 0.32, dampingFraction: 0.88).delay(0.08)),
+        removal: .move(edge: .leading).combined(with: .opacity)
+            .animation(.easeIn(duration: 0.1))
+    )
+    private static let sidebarTransition: AnyTransition = .asymmetric(
+        insertion: .move(edge: .leading).combined(with: .opacity)
+            .animation(.spring(response: 0.36, dampingFraction: 0.86).delay(0.06)),
+        removal: .move(edge: .leading).combined(with: .opacity)
+            .animation(.easeIn(duration: 0.16))
+    )
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             CanvasView()
@@ -18,17 +34,20 @@ struct RootView: View {
                         .padding(10)
                         .zIndex(600)
                         .contentShape(Rectangle())
+                        .transition(Self.sidebarTransition)
                 } else {
                     SidebarView()
                         .padding(10)
                         .zIndex(600)
                         .contentShape(Rectangle())
+                        .transition(Self.sidebarTransition)
                 }
             } else if app.settings.showChrome {
                 ProjectChip()
                     .padding(.top, 14)
                     .padding(.leading, 14)
                     .zIndex(600)
+                    .transition(Self.chipTransition)
             }
             if let id = app.boardMenuID, let lesson = app.library.lessons.first(where: { $0.id == id }) {
                 GeometryReader { geo in
@@ -193,6 +212,7 @@ struct RootView: View {
         if event.keyCode == 50, !typing, !cmd {
             app.navigatorOpen.toggle()
             AppSounds.play(app.navigatorOpen ? .transitionUp : .transitionDown)
+            AppHaptics.perform(.generic)
             return true
         }
 
@@ -295,6 +315,7 @@ struct RootView: View {
             case 1: // ⌘S
                 app.settings.snapping.toggle()
                 AppSounds.playToggle(app.settings.snapping)
+                AppHaptics.perform(.generic)
                 return true
             case 24: // ⌘= / ⌘+
                 zoom(1.15)
@@ -321,6 +342,10 @@ struct RootView: View {
     }
 
     private var isTyping: Bool {
+        // App state, not just the responder chain — a text card can be marked
+        // `editingID` a frame before its NSTextView actually wins first responder,
+        // and in that gap keystrokes would otherwise fall through to tool shortcuts.
+        if app.editingID != nil || app.noteOpenID != nil { return true }
         if let view = NSApp.keyWindow?.firstResponder as? NSTextView { return view.isEditable }
         return NSApp.keyWindow?.firstResponder is NSText
     }

@@ -174,9 +174,26 @@ enum Persistence {
         ensurePath(&lesson, subjects: subjects, taken: &taken)
     }
 
+    /// Filesystem-safe, reasonably short stem for an imported media file's name.
+    private static func sanitizedMediaName(_ raw: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let cleaned = raw.unicodeScalars
+            .map { allowed.contains($0) ? Character($0) : "-" }
+            .reduce(into: "") { $0.append($1) }
+        let collapsed = cleaned.replacingOccurrences(of: "-{2,}", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let truncated = String(collapsed.prefix(40))
+        return truncated.isEmpty ? "media" : truncated
+    }
+
     static func importFile(from source: URL, lesson: Lesson, subjects: [Subject]) -> URL? {
         let media = mediaDirectory(for: lesson, subjects: subjects)
-        let name = "\(VasaID.make("m"))\(source.pathExtension.isEmpty ? "" : ".\(source.pathExtension)")"
+        // Keep the source's own name (sanitized) instead of the bare "m_<hash>" id —
+        // legible when browsing the media folder in Finder, and it's what a derived
+        // poster's filename (video name + ".poster.jpg") inherits too.
+        let base = sanitizedMediaName(source.deletingPathExtension().lastPathComponent)
+        let suffix = String(UUID().uuidString.prefix(8)).lowercased()
+        let name = "\(base)-\(suffix)\(source.pathExtension.isEmpty ? "" : ".\(source.pathExtension)")"
         let dest = media.appendingPathComponent(name)
         do {
             if fm.fileExists(atPath: dest.path) {
