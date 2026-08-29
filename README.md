@@ -13,10 +13,6 @@ A native macOS infinite canvas for notes, images, links, and video — one quiet
 
 </div>
 
-<p align="center">
-  <img src="icon.png" width="160" alt="Vasa icon">
-</p>
-
 Vasa is a native macOS app for people who think by spreading things out — text, notes, images, links, audio, video, and freehand ink — all on one pannable, zoomable canvas instead of buried in folders and windows.
 
 It is local-first. Your library lives on your Mac under `~/Documents/Vasa Library`. AI features are opt-in through a provider you choose in Settings, never a requirement to open the app.
@@ -153,4 +149,4 @@ Apache License 2.0 — see [LICENSE](LICENSE).
 
 ### Inspired by
 
-Vasa is an infinite-canvas alternative to tools like [Kosmik](https://www.kosmik.app) for people who want their moodboard, research board, and second brain on native macOS instead of the web — plus a nod to [EMA App](https://ema.co) for the calm, quiet interaction design.
+Vasa is an infinite-canvas alternative to tools like [Kosmik](https://www.kosmik.app) for people who want their moodboard, research board, and second brain on native macOS instead of the web — plus a nod to [EMA App](https://repponen.com) for the calm, quiet interaction design.
