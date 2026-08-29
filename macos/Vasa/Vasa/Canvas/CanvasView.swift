@@ -71,7 +71,9 @@ struct CanvasView: View {
             .onDisappear {
                 if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor) }
             }
-            .onDrop(of: [.fileURL, .image], isTargeted: nil, perform: handleDrop)
+            .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers, location in
+                handleDrop(providers, at: toWorld(location, cam))
+            }
             .onContinuousHover(coordinateSpace: .named("canvas")) { phase in
                 updateCanvasCursor(phase, camera: cam)
             }
@@ -607,7 +609,7 @@ struct CanvasView: View {
         }
     }
 
-    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+    private func handleDrop(_ providers: [NSItemProvider], at point: CGPoint) -> Bool {
         for provider in providers {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
@@ -625,7 +627,7 @@ struct CanvasView: View {
                     }()
                     guard let url else { return }
                     Task { @MainActor in
-                        app.drop(urls: [url], at: app.lastWorld)
+                        app.drop(urls: [url], at: point)
                     }
                 }
             } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
@@ -636,14 +638,14 @@ struct CanvasView: View {
                 provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
                     guard let data, let image = NSImage(data: data) else { return }
                     Task { @MainActor in
-                        app.addImageCard(fromRawImage: image, at: app.lastWorld, alt: "Dropped image")
+                        app.addImageCard(fromRawImage: image, at: point, alt: "Dropped image")
                     }
                 }
             } else {
                 _ = provider.loadObject(ofClass: URL.self) { url, _ in
                     guard let url else { return }
                     Task { @MainActor in
-                        app.drop(urls: [url], at: app.lastWorld)
+                        app.drop(urls: [url], at: point)
                     }
                 }
             }

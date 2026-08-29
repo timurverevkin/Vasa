@@ -90,8 +90,14 @@ struct CanvasTextEditor: NSViewRepresentable {
         view.refreshEmptyPresentation()
         if editing {
             let caret = pendingCaret
-            view.window?.makeFirstResponder(view)
-            if let caret { Self.applyPendingCaret(caret, to: view) }
+            // Deferred: at this point the view isn't attached to the window yet, so
+            // `makeFirstResponder` now is a no-op. Match NoteEditor's pattern — hop
+            // to the next runloop tick, after AppKit has finished inserting it.
+            DispatchQueue.main.async { [weak view] in
+                guard let view else { return }
+                view.window?.makeFirstResponder(view)
+                if let caret { Self.applyPendingCaret(caret, to: view) }
+            }
             if caret != nil { onConsumeCaret?() }
         }
         return view
@@ -120,12 +126,19 @@ struct CanvasTextEditor: NSViewRepresentable {
         context.coordinator.suppressAutoResize = suppressAutoResize
         if editing {
             onBind?(view)
-            let fr = view.window?.firstResponder
-            let steal = fr == nil || fr === view.window
             let caret = pendingCaret
-            if steal, view.window?.firstResponder !== view {
-                view.window?.makeFirstResponder(view)
-                if let caret { Self.applyPendingCaret(caret, to: view) }
+            if view.window?.firstResponder !== view {
+                // Entering edit always claims first responder — whatever held it before
+                // (the canvas view that handled the placing click, a sidebar button, …)
+                // must yield, or the freshly placed block silently never becomes typable.
+                // Deferred a tick: stealing focus synchronously here can still be
+                // overridden afterward by AppKit's own responder resolution within
+                // the same update cycle (see NoteEditor's identical async hop).
+                DispatchQueue.main.async { [weak view] in
+                    guard let view, view.window?.firstResponder !== view else { return }
+                    view.window?.makeFirstResponder(view)
+                    if let caret { Self.applyPendingCaret(caret, to: view) }
+                }
             } else if let caret {
                 // Already first responder (e.g. re-entering edit without losing focus) —
                 // no responder hop to wait on, apply immediately.

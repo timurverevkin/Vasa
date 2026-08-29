@@ -678,10 +678,15 @@ struct LightboxView: View {
     }
 
     private var meta: String {
-        let name = URL(string: item.src)?.lastPathComponent ?? (item.alt ?? "Image")
-        let size = item.bytes ?? Theme.fileBytes(item.src)
-        if let size {
-            return "\(name)   —   \(Format.bytes(size))"
+        // For a video, `item.src` is the poster thumbnail (stand-in until playback
+        // starts) — name and size must come from `videoSrc`, the file actually
+        // being shown, or the header lies about what's on screen.
+        let metaSrc = item.videoSrc ?? item.src
+        let name = URL(string: metaSrc)?.lastPathComponent ?? (item.alt ?? "Image")
+        let size = item.videoSrc == nil ? item.bytes : nil
+        let resolved = size ?? Theme.fileBytes(metaSrc)
+        if let resolved {
+            return "\(name)   —   \(Format.bytes(resolved))"
         }
         return name
     }
