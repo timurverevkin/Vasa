@@ -255,6 +255,42 @@ enum Persistence {
         }
     }
 
+    /// Copy an external `.vasa` package into the library and return the lesson it holds,
+    /// re-homed onto a fresh id and a free path so importing the same file twice yields
+    /// two projects rather than clobbering one.
+    ///
+    /// The package stores media by relative path (`media/…`), so only the absolutize
+    /// half of the rename dance is needed — the bytes come across untouched.
+    static func importPackage(at source: URL, subjectId: String, subjects: [Subject], newID: String) -> Lesson? {
+        let boardURL = source.appendingPathComponent("board.json")
+        guard let data = try? Data(contentsOf: boardURL),
+              var lesson = try? JSONDecoder().decode(Lesson.self, from: data)
+        else { return nil }
+
+        lesson.id = newID
+        lesson.subjectId = subjectId
+        lesson.path = nil
+        lesson.updatedAt = Date().timeIntervalSince1970 * 1000
+        var taken = Set<String>()
+        let path = ensurePath(&lesson, subjects: subjects, taken: &taken)
+        lesson.path = path
+
+        let dest = projectsRoot.appendingPathComponent(path, isDirectory: true)
+        try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            if fm.fileExists(atPath: dest.path) {
+                try fm.removeItem(at: dest)
+            }
+            try fm.copyItem(at: source, to: dest)
+            lesson.cards = absolutizeMedia(lesson.cards, mediaFolder: dest.appendingPathComponent("media"))
+            writeBoard(lesson, to: dest.appendingPathComponent("board.json"))
+            lesson.bytes = folderBytes(dest)
+            return lesson
+        } catch {
+            return nil
+        }
+    }
+
     static func renameLessonFolder(_ lesson: inout Lesson, subjects: [Subject], title: String) {
         let old = lessonDirectory(lesson, subjects: subjects)
         let previousPath = lesson.path

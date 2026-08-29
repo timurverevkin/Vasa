@@ -1,5 +1,6 @@
 import AppKit
 import ImageIO
+import UniformTypeIdentifiers
 
 enum ImageMedia {
     nonisolated static let maxSide: CGFloat = 420
@@ -56,6 +57,61 @@ enum ImageMedia {
         }
         guard let image = NSImage(contentsOf: url), image.size.width > 0, image.size.height > 0 else { return nil }
         return image.size
+    }
+
+    enum PayloadError: Error {
+        case unreadable
+    }
+
+    /// A downscaled JPEG copy of `src` plus its pixel dimensions, for handing an
+    /// image to something outside the app. Re-encoding also drops EXIF (GPS included),
+    /// which is deliberate — this payload leaves the machine.
+    static func downscaledJPEG(
+        src: String,
+        maxEdge: CGFloat = 1600,
+        quality: CGFloat = 0.85
+    ) async throws -> (data: Data, width: Int, height: Int) {
+        if src.hasPrefix("http://") || src.hasPrefix("https://"), let remote = URL(string: src) {
+            let (data, response) = try await URLSession.shared.data(from: remote)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(status), !data.isEmpty else { throw PayloadError.unreadable }
+            return try await Task.detached(priority: .userInitiated) {
+                try downscaledJPEG(from: data, maxEdge: maxEdge, quality: quality)
+            }.value
+        }
+
+        guard let fileURL = fileURL(from: src),
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else { throw PayloadError.unreadable }
+
+        return try await Task.detached(priority: .userInitiated) {
+            try downscaledJPEG(from: Data(contentsOf: fileURL), maxEdge: maxEdge, quality: quality)
+        }.value
+    }
+
+    nonisolated static func downscaledJPEG(
+        from data: Data,
+        maxEdge: CGFloat = 1600,
+        quality: CGFloat = 0.85
+    ) throws -> (data: Data, width: Int, height: Int) {
+        guard let source = CGImageSourceCreateWithData(
+            data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary
+        ) else { throw PayloadError.unreadable }
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxEdge,
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) else {
+            throw PayloadError.unreadable
+        }
+        let mutable = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            mutable, UTType.jpeg.identifier as CFString, 1, nil
+        ) else { throw PayloadError.unreadable }
+        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { throw PayloadError.unreadable }
+        return (mutable as Data, cgImage.width, cgImage.height)
     }
 
     nonisolated static func cardSize(for pixelSize: CGSize, maxSide: CGFloat = maxSide) -> (width: Double, height: Double) {

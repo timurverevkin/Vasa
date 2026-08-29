@@ -173,14 +173,16 @@ struct CanvasTextEditor: NSViewRepresentable {
                 // on-screen runs — remap only the default-colored text in place, leaving any
                 // user-applied swatch untouched.
                 if inkChanged, let storage = view.textStorage {
-                    let prevHex = context.coordinator.lastInkHex.uppercased()
+                    // Matched by appearance, not against the previous ink hex: a run that
+                    // came back from stored HTML carries a colour-space-shifted variant of
+                    // that hex and would never compare equal.
                     let full = NSRange(location: 0, length: storage.length)
                     storage.enumerateAttribute(.foregroundColor, in: full) { value, range, _ in
-                        guard let color = value as? NSColor, color.vasaHex.uppercased() == prevHex else { return }
+                        guard let color = value as? NSColor, Theme.isAdaptiveInk(color) else { return }
                         storage.addAttribute(.foregroundColor, value: ink, range: range)
                     }
                     var typing = view.typingAttributes
-                    if let typingColor = typing[.foregroundColor] as? NSColor, typingColor.vasaHex.uppercased() == prevHex {
+                    if let typingColor = typing[.foregroundColor] as? NSColor, Theme.isAdaptiveInk(typingColor) {
                         typing[.foregroundColor] = ink
                         view.typingAttributes = typing
                     }
@@ -350,15 +352,15 @@ struct CanvasTextEditor: NSViewRepresentable {
                 }
                 mutable.addAttribute(.font, value: next, range: range)
             }
-            // Normalize colors to sRGB so preview + editor paint reliably.
-            // Remap near-black body text to the theme ink (dark mode adaptation).
+            // Normalize colors to sRGB so preview + editor paint reliably, and let plain
+            // body text follow the current appearance in both directions — text typed in
+            // light mode must not stay black on the dark canvas, nor the reverse.
             mutable.enumerateAttribute(.foregroundColor, in: full) { value, range, _ in
                 guard let color = value as? NSColor else {
                     mutable.addAttribute(.foregroundColor, value: ink, range: range)
                     return
                 }
-                let hex = color.vasaHex.uppercased()
-                if hex == "#111318" || hex == "#000000" || hex == "#1D1D1F" || hex == "#111111" {
+                if Theme.isAdaptiveInk(color) {
                     mutable.addAttribute(.foregroundColor, value: ink, range: range)
                 } else {
                     mutable.addAttribute(.foregroundColor, value: NSColor.vasa(hex: color.vasaHex), range: range)

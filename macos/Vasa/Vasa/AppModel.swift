@@ -389,6 +389,47 @@ final class AppModel {
         AppSounds.play(.celebration)
     }
 
+    /// Handles `.vasa` packages opened from Finder. Returns whether anything was taken in.
+    @discardableResult
+    func importVasaPackages(_ urls: [URL]) -> Bool {
+        let packages = urls.filter { $0.pathExtension.lowercased() == "vasa" }
+        guard !packages.isEmpty, let subject = library.subjects.first else { return false }
+
+        var lastID: String?
+        for url in packages {
+            // Opening a package that already lives in the library just reveals it —
+            // re-importing would leave the user with a silent duplicate.
+            if let existing = library.lessons.first(where: {
+                Persistence.lessonDirectory($0, subjects: library.subjects)
+                    .standardizedFileURL.path == url.standardizedFileURL.path
+            }) {
+                lastID = existing.id
+                continue
+            }
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            guard let imported = Persistence.importPackage(
+                at: url,
+                subjectId: subject.id,
+                subjects: library.subjects,
+                newID: VasaID.make("les")
+            ) else { continue }
+            library.lessons.insert(imported, at: 0)
+            lastID = imported.id
+        }
+
+        guard let lastID else {
+            AppSounds.play(.caution)
+            return false
+        }
+        indexDirty = true
+        saveNow()
+        openLesson(lastID, playSound: false)
+        boardWave += 1
+        AppSounds.play(.celebration)
+        return true
+    }
+
     func renameLesson(_ id: String, _ title: String) {
         guard let i = library.lessons.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1784,14 +1825,47 @@ final class AppModel {
         resizingCardID == id
     }
 
+    /// Exports a project as a `.vasa` package — the same self-contained layout the app
+    /// already stores on disk (`board.json` + `media/`), so the copy carries its images,
+    /// audio and video with it. The previous implementation wrote a bare `board.json`,
+    /// whose media paths are relative to a `media/` folder that was never included.
     func exportLesson(_ id: String) {
+        guard library.lessons.contains(where: { $0.id == id }) else { return }
+        // The package on disk is what gets copied, so pending edits must land first.
+        // Re-read afterwards: saving is what assigns `path` to a project that never had one.
+        saveNow()
         guard let lesson = library.lessons.first(where: { $0.id == id }) else { return }
+        let source = Persistence.lessonDirectory(lesson, subjects: library.subjects)
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "\(lesson.title).json"
+        if let type = UTType("app.vasa.project") {
+            panel.allowedContentTypes = [type]
+        }
+        // Name without the extension: AppKit owns it once the type is allowed, and
+        // hides it from the field either way — spelling it out here only risks
+        // "Name.vasa.vasa" if the panel ever stops recognising the type. The message
+        // below is what actually tells the user what they are getting.
+        panel.nameFieldStringValue = Persistence.sanitize(lesson.title)
         panel.canCreateDirectories = true
-        if panel.runModal() == .OK, let url = panel.url, let data = try? JSONEncoder().encode(lesson) {
-            try? data.write(to: url)
+        panel.isExtensionHidden = false
+        panel.title = "Export Project"
+        panel.prompt = "Export"
+        panel.message = "Exports a .vasa package — the board and all of its media in one file."
+        guard panel.runModal() == .OK, var dest = panel.url else { return }
+        // The panel can hand back a bare name when the type is a package; keep the
+        // extension so Finder still shows the result as one Vasa document.
+        if dest.pathExtension.lowercased() != "vasa" {
+            dest.appendPathExtension("vasa")
+        }
+        do {
+            if FileManager.default.fileExists(atPath: dest.path) {
+                try FileManager.default.removeItem(at: dest)
+            }
+            try FileManager.default.copyItem(at: source, to: dest)
+            AppSounds.play(.celebration)
+        } catch {
+            AppSounds.play(.caution)
         }
     }
 
@@ -3711,27 +3785,33 @@ final class AppModel {
     }
 
     /// Opens Google Lens in the default browser (new tab).
-    /// The image is submitted **by the browser** via a localhost bridge so the
+    /// The image is submitted **by the browser** via a loopback bridge so the
     /// session cookies match — app-side upload caused "Expired visual search".
     func openLens(_ src: String?) {
         guard let src, !src.isEmpty else {
-            openBrowserTab(URL(string: "https://lens.google.com/"))
+            openBrowserTab(LensUpload.lensHome)
             return
         }
+        // Stage the image on the clipboard up front, so every failure path — a
+        // changed Lens endpoint, a dead bridge — degrades to "Lens is open, press ⌘V"
+        // instead of a dead end. Skipped for a remote image, which needs no bridge.
+        if LensUpload.directUploadURL(for: src) == nil { copyImageToPasteboard(src) }
         Task { @MainActor in
             do {
                 try await LensUpload.openInBrowser(src: src)
             } catch {
-                if let fileURL = ImageMedia.fileURL(from: src),
-                   let image = NSImage(contentsOf: fileURL)
-                {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.writeObjects([image])
-                }
-                openBrowserTab(URL(string: "https://lens.google.com/"))
+                openBrowserTab(LensUpload.lensHome)
             }
         }
+    }
+
+    private func copyImageToPasteboard(_ src: String) {
+        guard let fileURL = ImageMedia.fileURL(from: src),
+              let image = NSImage(contentsOf: fileURL)
+        else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([image])
     }
 
     private func openBrowserTab(_ url: URL?) {
