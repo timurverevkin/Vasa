@@ -2,3 +2,6 @@
 *.log
 release/
 macos/DerivedData/
+*.profraw
+graphify-out/
+xcuserdata/

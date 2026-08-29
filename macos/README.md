@@ -1,17 +1,17 @@
-# Nexus (Swift)
+# Vasa (Swift)
 
 Native macOS app — SwiftUI.
 
 Open and run:
 
 ```
-open macos/Nexus/Nexus.xcodeproj
+open macos/Vasa/Vasa.xcodeproj
 ```
 
 or:
 
 ```
-xcodebuild -project macos/Nexus/Nexus.xcodeproj -scheme Nexus -configuration Debug
+xcodebuild -project macos/Vasa/Vasa.xcodeproj -scheme Vasa -configuration Debug
 ```
 
 ## Release DMG
@@ -20,4 +20,4 @@ xcodebuild -project macos/Nexus/Nexus.xcodeproj -scheme Nexus -configuration Deb
 ./scripts/build-native-macos.sh
 ```
 
-Скрипт собирает Release `.app` через `xcodebuild` и упаковывает `release/Nexus-<version>-<arch>-native.dmg` (плюс копия `release/Nexus-native.app`).
+Скрипт собирает Release `.app` через `xcodebuild` и упаковывает `release/Vasa-<version>-<arch>-native.dmg` (плюс копия `release/Vasa-native.app`).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка нативного Swift Nexus (.app + .dmg).
+# Сборка нативного Swift Vasa (.app + .dmg).
 #
 #   ./scripts/build-native-macos.sh              # arch этой машины
 #   ./scripts/build-native-macos.sh arm64
@@ -30,12 +30,12 @@ case "$ARCH" in
   *) echo "Ожидается arm64 или x86_64 (получено: $1)"; exit 1 ;;
 esac
 
-PROJECT="$ROOT/macos/Nexus/Nexus.xcodeproj"
-SCHEME="Nexus"
+PROJECT="$ROOT/macos/Vasa/Vasa.xcodeproj"
+SCHEME="Vasa"
 CONFIG="Release"
 DERIVED="$ROOT/macos/DerivedData"
 OUT="$ROOT/release"
-APP_BUILT="$DERIVED/Build/Products/$CONFIG/Nexus.app"
+APP_BUILT="$DERIVED/Build/Products/$CONFIG/Vasa.app"
 
 mkdir -p "$OUT" "$DERIVED"
 
@@ -59,9 +59,9 @@ DMG_ARCH_LABEL="$ARCH"
 if [[ "$ARCH" == "x86_64" ]]; then
   DMG_ARCH_LABEL="x64"
 fi
-DMG_NAME="Nexus-${VERSION}-${DMG_ARCH_LABEL}-native.dmg"
+DMG_NAME="Vasa-${VERSION}-${DMG_ARCH_LABEL}-native.dmg"
 DMG_PATH="$OUT/$DMG_NAME"
-APP_COPY="$OUT/Nexus-native.app"
+APP_COPY="$OUT/Vasa-native.app"
 STAGE="$OUT/.dmg-stage-native"
 
 echo "→ Копирую .app → $APP_COPY"
@@ -71,12 +71,12 @@ ditto "$APP_BUILT" "$APP_COPY"
 echo "→ DMG $DMG_NAME"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-ditto "$APP_BUILT" "$STAGE/Nexus.app"
+ditto "$APP_BUILT" "$STAGE/Vasa.app"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG_PATH"
 
 hdiutil create \
-  -volname "Nexus" \
+  -volname "Vasa" \
   -srcfolder "$STAGE" \
   -ov \
   -format UDZO \
@@ -88,6 +88,6 @@ rm -rf "$STAGE"
 echo
 echo "Готово:"
 ls -lh "$DMG_PATH" "$APP_COPY"
-file "$APP_COPY/Contents/MacOS/Nexus"
+file "$APP_COPY/Contents/MacOS/Vasa"
 echo
 echo "open \"$OUT\""
