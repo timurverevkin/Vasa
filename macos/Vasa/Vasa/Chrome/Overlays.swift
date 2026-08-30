@@ -589,29 +589,19 @@ struct LightboxView: View {
             Theme.canvasColor(scheme).ignoresSafeArea()
             VStack(spacing: 0) {
                 HStack {
-                    Button { app.lightbox = nil } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Theme.primaryInk(scheme))
-                            .frame(width: 28, height: 28)
-                            .background(scheme == .dark ? Color.white.opacity(0.12) : Color.white, in: Circle())
-                            .overlay(Circle().stroke(Theme.hairline(scheme)))
-                    }
-                    .buttonStyle(.plain)
+                    lightboxChromeButton(system: "chevron.left", rotated: false) { app.lightbox = nil }
                     Spacer()
-                    Text(meta)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(scheme == .dark ? Color.white.opacity(0.7) : Theme.muted)
-                    Spacer()
-                    Button { menuOpen.toggle() } label: {
-                        Image(systemName: "ellipsis")
-                            .font(.system(size: 13, weight: .semibold))
+                    HStack(spacing: 8) {
+                        Text(fileName)
+                            .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(Theme.primaryInk(scheme))
-                            .frame(width: 28, height: 28)
-                            .background(scheme == .dark ? Color.white.opacity(0.12) : Color.white, in: Circle())
-                            .overlay(Circle().stroke(Theme.hairline(scheme)))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let dimensions { metaBadge(dimensions) }
+                        if let weight { metaBadge(weight) }
                     }
-                    .buttonStyle(.plain)
+                    Spacer()
+                    lightboxChromeButton(system: "ellipsis", rotated: true) { menuOpen.toggle() }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 12)
@@ -679,18 +669,56 @@ struct LightboxView: View {
         }
     }
 
-    private var meta: String {
-        // For a video, `item.src` is the poster thumbnail (stand-in until playback
-        // starts) — name and size must come from `videoSrc`, the file actually
-        // being shown, or the header lies about what's on screen.
-        let metaSrc = item.videoSrc ?? item.src
-        let name = URL(string: metaSrc)?.lastPathComponent ?? (item.alt ?? "Image")
-        let size = item.videoSrc == nil ? item.bytes : nil
-        let resolved = size ?? Theme.fileBytes(metaSrc)
-        if let resolved {
-            return "\(name)   —   \(Format.bytes(resolved))"
+    /// Squircle chrome button — the shape the reference preview uses for both corners.
+    private func lightboxChromeButton(
+        system: String,
+        rotated: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.primaryInk(scheme))
+                .rotationEffect(.degrees(rotated ? 90 : 0))
+                .frame(width: 30, height: 30)
+                .background(
+                    scheme == .dark ? Color.white.opacity(0.12) : Color.white,
+                    in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                )
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Theme.hairline(scheme)))
+                .contentShape(Rectangle())
         }
-        return name
+        .buttonStyle(.plain)
+    }
+
+    /// One fact about the file (pixel size, weight): square hairline outline, no fill.
+    /// Drawn as an overlay — a plain `.background(Color)` bleeds past the safe area and
+    /// ran up into the titlebar.
+    private func metaBadge(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(scheme == .dark ? Color.white.opacity(0.72) : Theme.muted)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .overlay(Rectangle().stroke(Theme.hairline(scheme), lineWidth: 1))
+    }
+
+    /// For a video, `item.src` is the poster thumbnail (stand-in until playback starts) —
+    /// name, size and dimensions must come from `videoSrc`, the file actually on screen.
+    private var metaSource: String { item.videoSrc ?? item.src }
+
+    private var fileName: String {
+        URL(string: metaSource)?.lastPathComponent ?? (item.alt ?? "Image")
+    }
+
+    private var dimensions: String? {
+        guard item.videoSrc == nil, let size = Theme.pixelSize(metaSource) else { return nil }
+        return "\(Int(size.width)) × \(Int(size.height))"
+    }
+
+    private var weight: String? {
+        let bytes = (item.videoSrc == nil ? item.bytes : nil) ?? Theme.fileBytes(metaSource)
+        return bytes.map { Format.bytes($0) }
     }
 
     private var lightboxMenu: some View {
@@ -1051,7 +1079,7 @@ struct ItemMenuOverlay: View {
         if card.kind == .video || card.kind == .youtube {
             MenuRow(system: "eye", title: "Preview", shortcut: "Space") {
                 if card.kind == .video {
-                    app.lightbox = LightboxItem(src: card.poster ?? "", alt: card.title, videoSrc: card.src)
+                    app.openVideoPreview(card)
                 } else if let id = card.videoId {
                     app.lightbox = LightboxItem(src: "https://img.youtube.com/vi/\(id)/hqdefault.jpg", alt: card.title)
                 }

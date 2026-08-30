@@ -11,6 +11,20 @@ enum ImageMedia {
     // NSCache is internally thread-safe; Swift concurrency just doesn't know that.
     nonisolated(unsafe) private static let cache = NSCache<NSString, NSImage>()
 
+    /// Synchronous cache peek — lets a view render an already-decoded image on its
+    /// first frame instead of flashing a placeholder while an async task starts.
+    /// Session-lived: once a thumbnail is decoded it stays available until memory
+    /// pressure evicts it, so reopening a project or scrolling the sidebar is instant.
+    static func cachedThumbnail(src: String, maxPixelSize: CGFloat) -> NSImage? {
+        cache.object(forKey: "\(src)#\(Int(maxPixelSize))" as NSString)
+    }
+
+    /// Warms the cache without needing a view on screen — used to prefetch a board's
+    /// media after its layout and text have already been painted.
+    static func prefetchThumbnail(src: String, maxPixelSize: CGFloat) async {
+        _ = await loadThumbnail(src: src, maxPixelSize: maxPixelSize)
+    }
+
     /// Downsampled async decode via ImageIO (cheap vs a full-res `NSImage(contentsOf:)`
     /// decode on the main thread) — cached after first load so re-entering the
     /// viewport never re-decodes.

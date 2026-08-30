@@ -269,6 +269,19 @@ struct NoteRichText: NSViewRepresentable {
 
 /// Note editor text view — click ☐/☑ to toggle without selecting the glyph.
 private final class NoteChecklistTextView: NSTextView {
+    /// Same guard as `GrowingTextView`: never let the mark's inflated cell font become
+    /// the font of what the user types next to it.
+    override var typingAttributes: [NSAttributedString.Key: Any] {
+        get { super.typingAttributes }
+        set {
+            var attrs = newValue
+            if let font = attrs[.font] as? NSFont, font.familyName == TodoMarks.markFamily {
+                attrs[.font] = NSFont.systemFont(ofSize: TodoMarks.bodySize(fromMark: font))
+            }
+            super.typingAttributes = attrs
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if let idx = TodoMarks.checkboxUTF16Index(in: self, at: point),

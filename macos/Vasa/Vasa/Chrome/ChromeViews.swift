@@ -186,34 +186,20 @@ struct DrawInkBar: View {
     @State private var colorsOpen = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            HStack(spacing: 4) {
-                toolButton(system: "pencil.tip", mode: .pen)
-                toolButton(system: "eraser", mode: .eraser)
-                DrawThicknessSlider(value: Binding(
-                    get: { app.drawWidth },
-                    set: { app.drawWidth = min(28, max(1, $0)) }
-                ))
-                colorButton
-            }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 5)
-            .chromePill(14)
-
-            Button {
-                app.tool = .select
-                app.drawMode = .pen
-                app.activeInkCardID = nil
-                colorsOpen = false
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Theme.primaryInk(scheme))
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .chromePill(10)
+        HStack(spacing: 4) {
+            toolButton(system: "pencil.tip", mode: .pen)
+            toolButton(system: "eraser", mode: .eraser)
+            DrawThicknessSlider(value: Binding(
+                get: { app.drawWidth },
+                set: { app.drawWidth = min(28, max(1, $0)) }
+            ))
+            colorButton
         }
+        .padding(.horizontal, 6)
+        // 28pt controls + 2pt = 32pt tall, matching the project chip and the zoom
+        // controls so all top chrome sits on one line.
+        .padding(.vertical, 2)
+        .chromePill(10)
         .overlay(alignment: .topLeading) {
             if colorsOpen {
                 ColorPalette(
@@ -221,19 +207,20 @@ struct DrawInkBar: View {
                     onReset: {
                         app.drawColor = "#111318"
                         app.drawColorCustom = false
-                        app.recolorActiveInk("#111318")
                         colorsOpen = false
                     }
                 ) { hex in
                     app.drawColor = hex
                     app.drawColorCustom = true
-                    app.recolorActiveInk(hex)
                     colorsOpen = false
                 }
                 .padding(6)
                 .chromePill(12)
-                .offset(y: 44)
-                .padding(.leading, 120)
+                .offset(y: 38)
+                // Line the reset cell up under the ink-color button: pill padding 6 +
+                // pen 28 + 4 + eraser 28 + 4 + slider 118 + 4, minus the palette's own
+                // pill (6) and content (8) padding and half a swatch cell (14).
+                .padding(.leading, 178)
             }
         }
     }
@@ -249,6 +236,9 @@ struct DrawInkBar: View {
                 .foregroundStyle(on ? Color.white : Theme.primaryInk(scheme))
                 .frame(width: 28, height: 28)
                 .background(on ? Theme.selectFill(scheme) : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                // A clear background takes no hits, so without this the button only
+                // answered on the glyph itself instead of its whole 28pt cell.
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(mode == .pen ? "Pen" : "Eraser")
@@ -274,6 +264,7 @@ struct DrawInkBar: View {
                 colorsOpen ? (scheme == .dark ? Color.white.opacity(0.12) : Theme.hover) : Color.clear,
                 in: RoundedRectangle(cornerRadius: 8, style: .continuous)
             )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help("Ink color")
@@ -294,6 +285,8 @@ private struct DrawThicknessSlider: View {
             let w = geo.size.width
             let t = CGFloat((value - range.lowerBound) / (range.upperBound - range.lowerBound))
             let x = thumb / 2 + max(0, min(1, t)) * max(0, w - thumb)
+            // 4pt at the thinnest stroke up to 12pt at the thickest, inside an 18pt thumb.
+            let core = 4 + max(0, min(1, t)) * 8
 
             ZStack(alignment: .leading) {
                 Capsule()
@@ -302,21 +295,27 @@ private struct DrawThicknessSlider: View {
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 2)
 
+                // Light theme: dark disc with a white core. Dark theme flips it, so the
+                // thumb always reads against the track. The core is sized by the value —
+                // it previews the brush itself.
                 Circle()
-                    .fill(Color.white)
-                    .overlay(Circle().strokeBorder(Theme.primaryInk(scheme), lineWidth: 3.5))
+                    .fill(scheme == .dark ? Color.white : Theme.ink)
+                    .overlay(
+                        Circle()
+                            .fill(scheme == .dark ? Theme.ink : Color.white)
+                            .frame(width: core, height: core)
+                    )
                     .frame(width: thumb, height: thumb)
                     .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
                     .position(x: x, y: geo.size.height / 2)
             }
             .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { drag in
-                        let u = (drag.location.x - thumb / 2) / max(1, w - thumb)
-                        let clamped = min(1, max(0, u))
-                        value = range.lowerBound + Double(clamped) * (range.upperBound - range.lowerBound)
-                    }
+            .overlay(
+                SliderDragCatcher { x in
+                    let u = (x - thumb / 2) / max(1, w - thumb)
+                    let clamped = min(1, max(0, u))
+                    value = range.lowerBound + Double(clamped) * (range.upperBound - range.lowerBound)
+                }
             )
         }
         .frame(width: 118, height: 28)

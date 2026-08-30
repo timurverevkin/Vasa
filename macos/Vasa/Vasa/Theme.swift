@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 
 enum Theme {
@@ -144,6 +145,25 @@ enum Theme {
 
     static func canvasColor(_ scheme: ColorScheme) -> Color {
         scheme == .dark ? Color(red: 0.13, green: 0.13, blue: 0.145) : canvas
+    }
+
+    /// Pixel dimensions of a local image, read from the file header (no full decode).
+    static func pixelSize(_ src: String) -> CGSize? {
+        let path: String
+        if src.hasPrefix("file:"), let url = URL(string: src) {
+            path = url.path
+        } else if src.hasPrefix("http") {
+            return nil
+        } else {
+            path = src
+        }
+        let url = URL(fileURLWithPath: path)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Double,
+              let height = props[kCGImagePropertyPixelHeight] as? Double
+        else { return nil }
+        return CGSize(width: width, height: height)
     }
 
     static func fileBytes(_ src: String) -> Double? {

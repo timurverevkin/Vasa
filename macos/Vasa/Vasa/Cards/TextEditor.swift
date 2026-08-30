@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import SwiftUI
 
 struct CanvasTextEditor: NSViewRepresentable {
@@ -23,6 +24,10 @@ struct CanvasTextEditor: NSViewRepresentable {
     var onEndEditing: (() -> Void)?
     var onSelectionChange: ((NSRange, CGRect?) -> Void)?
     var onBind: ((GrowingTextView?) -> Void)?
+    /// Checkbox square (view coordinates) of a mark the user just toggled.
+    var onToggleCheckbox: ((CGRect) -> Void)?
+    /// True while the pointer sits on one of this card's checkboxes.
+    var onCheckboxHover: ((Bool) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -37,6 +42,8 @@ struct CanvasTextEditor: NSViewRepresentable {
 
     func makeNSView(context: Context) -> GrowingTextView {
         let view = GrowingTextView()
+        view.onToggleCheckbox = onToggleCheckbox
+        view.onCheckboxHover = onCheckboxHover
         view.drawsBackground = false
         view.backgroundColor = .clear
         view.isRichText = true
@@ -104,6 +111,8 @@ struct CanvasTextEditor: NSViewRepresentable {
     }
 
     func updateNSView(_ view: GrowingTextView, context: Context) {
+        view.onToggleCheckbox = onToggleCheckbox
+        view.onCheckboxHover = onCheckboxHover
         context.coordinator.onChange = onChange
         context.coordinator.onBeginEditing = onBeginEditing
         context.coordinator.onEndEditing = onEndEditing
@@ -319,6 +328,11 @@ struct CanvasTextEditor: NSViewRepresentable {
         }()
         typing[.font] = NSFont.systemFont(ofSize: size, weight: weight)
         view.typingAttributes = typing
+        // `view.font` drives the caret height and the empty/single-line centering; leaving it
+        // at the old size made a 36pt card draw a 16pt caret once its text was deleted, and
+        // `refreshEmptyPresentation` then wrote that stale font back into typingAttributes.
+        view.font = NSFont.systemFont(ofSize: size, weight: weight)
+        (view as? GrowingTextView)?.refreshEmptyPresentation()
         view.font = typing[.font] as? NSFont
     }
 
@@ -729,7 +743,12 @@ enum TextListMarkup {
         var attrs = fallback
         guard storage.length > 0 else { return attrs }
         let probe = min(max(0, paragraph.location), storage.length - 1)
-        if let font = storage.attribute(.font, at: probe, effectiveRange: nil) as? NSFont {
+        // A todo line starts with the mark, whose font `markFont` deliberately inflates.
+        // Probing it handed that font to the next line, so Enter produced a line typed at
+        // 1.8× — and its own mark was then inflated again on top of that.
+        if TodoMarks.isMark((storage.string as NSString).character(at: probe)) {
+            attrs[.font] = TodoMarks.bodyFont(in: storage, at: probe)
+        } else if let font = storage.attribute(.font, at: probe, effectiveRange: nil) as? NSFont {
             attrs[.font] = font
         }
         if let color = storage.attribute(.foregroundColor, at: probe, effectiveRange: nil) as? NSColor {
@@ -757,11 +776,18 @@ enum TextListMarkup {
         }
         view.setSelectedRange(NSRange(location: range.location + (mark as NSString).length, length: 0))
         view.didChangeText()
+        // Type at the body size after the mark: `restyleMarks` owns the mark's own font,
+        // and letting it leak into typing attributes is what blew the next line up.
         TextTypingStyle.restore(attrs, on: view)
     }
 }
 
 /// ☐ / ☑ list marks — clickable in preview and while editing.
+extension NSAttributedString.Key {
+    /// Display-only marker for text on a ticked todo line — never serialized.
+    static let todoDimmed = NSAttributedString.Key("vasaTodoDimmed")
+}
+
 enum TodoMarks {
     nonisolated static let unchecked: unichar = 0x2610
     nonisolated static let checked: unichar = 0x2611
@@ -776,8 +802,37 @@ enum TodoMarks {
     /// Keep it at the body's own size so the checkbox never inflates the
     /// line/text-block; `drawCheckbox` does all the "make it look chunky and
     /// distinct" work purely by painting bigger than that reserved cell.
+    /// The mark reserves a cell 1.8 × the body size. Reference rows measure 145 px pitch
+    /// on a 49 px cap height with an 86 px box and a 37 px gap before the text: that extra
+    /// room comes from the mark's own font, and it is what keeps the painted square clear
+    /// of both the neighbouring rows and the following text.
+    /// How much bigger than the body the mark's cell is.
+    nonisolated static let markScale: CGFloat = 1.8
+
+    /// Family the marks are drawn from — text must never end up in it.
+    nonisolated static var markFamily: String {
+        markFont(bodyFont: .systemFont(ofSize: 16)).familyName ?? "Apple Symbols"
+    }
+
+    /// Body size behind a font that is really a mark cell.
+    nonisolated static func bodySize(fromMark font: NSFont) -> CGFloat {
+        max(8, (font.pointSize / markScale).rounded())
+    }
+
     static func markFont(bodyFont: NSFont) -> NSFont {
-        bodyFont
+        let size = bodyFont.pointSize * markScale
+        let base = NSFont.systemFont(ofSize: size)
+        // Resolve whichever face actually supplies ☐ and use it for ☑ as well. Left to
+        // the system font, the two marks fall back to different faces with different
+        // line metrics (fragment 28.4 pt / baseline 19 for ☐ against 34 / 28 for ☑),
+        // so ticking an item dropped that whole row — box and text — by 9 pt.
+        let resolved = CTFontCreateForString(
+            base as CTFont,
+            "\u{2610}" as CFString,
+            CFRange(location: 0, length: 1)
+        )
+        let descriptor = CTFontCopyFontDescriptor(resolved) as NSFontDescriptor
+        return NSFont(descriptor: descriptor, size: size) ?? base
     }
 
     /// Re-applies the enlarged/bold checkbox font to every ☐/☑ in `range` of
@@ -786,15 +841,62 @@ enum TodoMarks {
     /// own current font — so calling this repeatedly (on every edit) can't
     /// compound the enlargement.
     static func restyleMarks(in text: NSMutableAttributedString, range: NSRange? = nil) {
+        if range == nil { healInheritedMarkFont(in: text) }
         let full = range ?? NSRange(location: 0, length: text.length)
         guard full.length > 0, NSMaxRange(full) <= text.length else { return }
         let ns = text.string as NSString
         for idx in full.location..<NSMaxRange(full) {
-            guard isMark(ns.character(at: idx)) else { continue }
-            let bodyProbe = min(idx + 2, text.length - 1)
-            let bodyFont = (text.attribute(.font, at: max(0, bodyProbe), effectiveRange: nil) as? NSFont)
-                ?? NSFont.systemFont(ofSize: 16)
-            text.addAttribute(.font, value: markFont(bodyFont: bodyFont), range: NSRange(location: idx, length: 1))
+            let ch = ns.character(at: idx)
+            guard isMark(ch) else { continue }
+            let body = bodyFont(in: text, at: idx)
+            let mark = markFont(bodyFont: body)
+            let cell = NSRange(location: idx, length: 1)
+            text.addAttribute(.font, value: mark, range: cell)
+            // ☐ and ☑ can fall back to system glyphs with different advances, which made
+            // the text after the mark (and the box drawn over it) shift sideways the
+            // moment an item was ticked. Kern each mark back to the ☐ advance so the
+            // cell is the same width in both states.
+            let target = advance(of: unchecked, in: mark)
+            let actual = advance(of: ch, in: mark)
+            text.addAttribute(.kern, value: target - actual, range: cell)
+            applyDimming(in: text, markAt: idx)
+        }
+    }
+
+    /// Repairs text that inherited the mark's own (inflated, symbol-family) font — older
+    /// saves made on Enter, before `markAttributes` learned to probe the line's body.
+    /// Any non-mark character in that family drops back to the system font at the size the
+    /// body would have had.
+    static func healInheritedMarkFont(in text: NSMutableAttributedString) {
+        guard text.length > 0 else { return }
+        let family = markFamily
+        let ns = text.string as NSString
+        text.enumerateAttribute(.font, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+            guard let font = value as? NSFont, font.familyName == family else { return }
+            for idx in range.location..<NSMaxRange(range) where !isMark(ns.character(at: idx)) {
+                text.addAttribute(
+                    .font,
+                    value: NSFont.systemFont(ofSize: bodySize(fromMark: font)),
+                    range: NSRange(location: idx, length: 1)
+                )
+            }
+        }
+    }
+
+    /// A ticked item reads as done: its own line's text draws dimmed (measured at ~52%
+    /// of the live ink in the reference — #7F8593 against #F5F6FB). Display-only, via a
+    /// private key `TodoAwareLayoutManager` paints from, so no color is ever written
+    /// into the card's HTML.
+    static func applyDimming(in text: NSMutableAttributedString, markAt idx: Int) {
+        let ns = text.string as NSString
+        let line = ns.lineRange(for: NSRange(location: idx, length: 1))
+        let tailStart = idx + 1
+        let tail = NSRange(location: tailStart, length: max(0, NSMaxRange(line) - tailStart))
+        guard tail.length > 0 else { return }
+        if ns.character(at: idx) == checked {
+            text.addAttribute(.todoDimmed, value: true, range: tail)
+        } else {
+            text.removeAttribute(.todoDimmed, range: tail)
         }
     }
 
@@ -822,9 +924,12 @@ enum TodoMarks {
                 actualCharacterRange: nil
             )
             let glyphRect = lm.boundingRect(forGlyphRange: glyphs, in: tc)
-            let font = (textView.textStorage?.attribute(.font, at: idx, effectiveRange: nil) as? NSFont)
-                ?? .systemFont(ofSize: 16)
-            let box = checkboxBox(for: glyphRect, font: font).insetBy(dx: -6, dy: -6)
+            let font = textView.textStorage.map { bodyFont(in: $0, at: idx) } ?? .systemFont(ofSize: 16)
+            let box = checkboxBox(
+                for: glyphRect,
+                baselineY: baselineY(in: lm, glyphs: glyphs),
+                font: font
+            ).insetBy(dx: -6, dy: -6)
             if box.contains(point) { return idx }
         }
         return nil
@@ -832,13 +937,76 @@ enum TodoMarks {
 
     /// The square `drawCheckbox` paints, in the glyph's own coordinate space — shared with
     /// `checkboxUTF16Index` so the clickable area always matches what's actually drawn.
-    static func checkboxBox(for glyphRect: NSRect, font: NSFont) -> NSRect {
-        // Size from the font alone, never from the glyph's own measured rect: ☐ and ☑
-        // can fall back to different system glyphs with different natural bounding
-        // boxes, which made the box visibly grow the moment a mark was checked. Only
-        // the box's *position* (its center) still follows the glyph's laid-out rect.
-        let side = font.capHeight * 1.35
-        return NSRect(x: glyphRect.midX - side / 2, y: glyphRect.midY - side / 2, width: side, height: side)
+    ///
+    /// Nothing here may depend on which mark is present: size comes from the line's body
+    /// font, position from the line fragment and the ☐ cell width. Ticking a box only ever
+    /// adds the checkmark — it never moves or resizes the square.
+    static func checkboxBox(for glyphRect: NSRect, baselineY: CGFloat? = nil, font: NSFont) -> NSRect {
+        // Reference proportion: 86 px box on a 49 px cap height.
+        let side = font.capHeight * 1.75
+        // Left-aligned in the cell the mark reserves (`markFont`), not centered on the
+        // drawn glyph: the reference leaves a clear gap between box and text, so the
+        // cell's slack belongs on the text side.
+        // Vertically the box tracks the text, not the line box: the mark's inflated font
+        // makes the line fragment much taller than the letters, so the fragment's center
+        // sits above them. Centering on the cap height keeps box and text level.
+        let centerY = baselineY.map { $0 - font.capHeight / 2 } ?? glyphRect.midY
+        return NSRect(x: glyphRect.minX, y: centerY - side / 2, width: side, height: side)
+    }
+
+    /// Baseline of the line a mark sits on, in the layout manager's coordinates.
+    static func baselineY(in lm: NSLayoutManager, glyphs: NSRange) -> CGFloat {
+        let line = lm.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+        return line.minY + lm.location(forGlyphAt: glyphs.location).y
+    }
+
+    /// Advance width of one mark character in `font`.
+    nonisolated static func advance(of ch: unichar, in font: NSFont) -> CGFloat {
+        var value = ch
+        let string = NSString(characters: &value, length: 1)
+        return string.size(withAttributes: [.font: font]).width
+    }
+
+    /// Font of the line's text, not of the mark character — so a toggle (which can
+    /// restyle the mark itself) can never change the box's size.
+    nonisolated static func bodyFont(in storage: NSAttributedString, at utf16: Int) -> NSFont {
+        let ns = storage.string as NSString
+        func real(_ idx: Int) -> NSFont? {
+            let ch = ns.character(at: idx)
+            guard !isMark(ch), ch != 0x20, ch != 0x000A, ch != 0x000D else { return nil }
+            return storage.attribute(.font, at: idx, effectiveRange: nil) as? NSFont
+        }
+        // Text on this line, then anywhere in the block. Never the mark's own font: that
+        // one is inflated by `markFont`, so an item with no text yet drew a giant box
+        // that snapped smaller the moment the first character was typed.
+        var probe = utf16 + 1
+        while probe < ns.length {
+            let ch = ns.character(at: probe)
+            if ch == 0x000A || ch == 0x000D { break }
+            if let font = real(probe) { return font }
+            probe += 1
+        }
+        for idx in 0..<ns.length where idx != utf16 {
+            if let font = real(idx) { return font }
+        }
+        return .systemFont(ofSize: 16)
+    }
+
+    /// The painted checkbox square in the text view's own coordinates — what the
+    /// toggle halftone centers on.
+    static func checkboxRect(in textView: NSTextView, at utf16: Int) -> NSRect? {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer,
+              let storage = textView.textStorage, utf16 >= 0, utf16 < storage.length
+        else { return nil }
+        let glyphs = lm.glyphRange(
+            forCharacterRange: NSRange(location: utf16, length: 1),
+            actualCharacterRange: nil
+        )
+        let glyphRect = lm.boundingRect(forGlyphRange: glyphs, in: tc)
+        let font = bodyFont(in: storage, at: utf16)
+        let origin = textView.textContainerOrigin
+        return checkboxBox(for: glyphRect, baselineY: baselineY(in: lm, glyphs: glyphs), font: font)
+            .offsetBy(dx: origin.x, dy: origin.y)
     }
 
     @discardableResult
@@ -854,6 +1022,7 @@ enum TodoMarks {
         else { return false }
         storage.replaceCharacters(in: NSRange(location: utf16, length: 1), with: next)
         restyleMarks(in: storage, range: NSRange(location: utf16, length: 1))
+        textView.needsDisplay = true
         AppSounds.playToggle(next == "☑")
         return true
     }
@@ -902,46 +1071,112 @@ enum TodoMarks {
     /// used by `TodoAwareLayoutManager`. Purely a paint step: the character
     /// under it is still literally "☐"/"☑", so every match/toggle/persist
     /// path that depends on that literal character keeps working unchanged.
-    nonisolated static func drawCheckbox(checked: Bool, in glyphRect: NSRect, font: NSFont) {
-        let box = checkboxBox(for: glyphRect, font: font)
+    nonisolated static func drawCheckbox(
+        checked: Bool,
+        hovered: Bool = false,
+        in glyphRect: NSRect,
+        baselineY: CGFloat? = nil,
+        font: NSFont
+    ) {
+        let box = checkboxBox(for: glyphRect, baselineY: baselineY, font: font)
         let side = box.width
         guard side > 1 else { return }
-        let radius = side * 0.26
+        // Reference proportions on an 86 px box: 17 px corner radius, 4 px stroke.
+        let radius = side * 0.20
         // Dynamic providers so the checkbox brightens with the effective appearance instead
         // of keeping its light-mode gray/blue when the app (or the system) switches to dark.
+        // Resting stroke is dim; pointing at the box lifts it (measured 0.24 → 0.47 white).
         let strokeColor = NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-                ? NSColor(calibratedWhite: 0.5, alpha: 1)
-                : NSColor(calibratedWhite: 0.62, alpha: 1)
+            let dark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let white: CGFloat = dark
+                ? (hovered ? 0.47 : 0.26)
+                : (hovered ? 0.55 : 0.72)
+            return NSColor(calibratedWhite: white, alpha: 1)
         }
         let checkColor = NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-                ? NSColor(calibratedRed: 0.58, green: 0.66, blue: 0.80, alpha: 1)
-                : NSColor(calibratedRed: 0.35, green: 0.42, blue: 0.53, alpha: 1)
+                ? NSColor(calibratedWhite: hovered ? 0.92 : 0.75, alpha: 1)
+                : NSColor(calibratedWhite: hovered ? 0.28 : 0.38, alpha: 1)
+        }
+        // Filled, not hollow: the reference paints the well a touch lighter than the card
+        // (#1E1D24 against #17171B); in light mode it is plain white under the same stroke.
+        let fillColor = NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(calibratedRed: 0.118, green: 0.114, blue: 0.141, alpha: 1)
+                : NSColor(calibratedWhite: 1, alpha: 1)
         }
         let path = NSBezierPath(roundedRect: box.insetBy(dx: side * 0.06, dy: side * 0.06), xRadius: radius, yRadius: radius)
-        path.lineWidth = max(1.4, side * 0.1)
+        path.lineWidth = max(1.2, side * 0.055)
+        fillColor.setFill()
+        path.fill()
         strokeColor.setStroke()
         path.stroke()
         guard checked else { return }
         let check = NSBezierPath()
-        check.lineWidth = max(1.6, side * 0.12)
+        let pen = max(1.6, side * 0.12)
+        check.lineWidth = pen
         check.lineCapStyle = .round
         check.lineJoinStyle = .round
+        // Round caps push the painted shape half a pen past every endpoint, so the path
+        // is laid out from the *inked* box it should occupy and then inset by that half
+        // pen. Painted extent: 0.64 × 0.50 of the square, centered on it exactly.
+        let cap = pen / 2
+        let inkW = side * 0.64
+        let inkH = side * 0.50
+        let left = box.midX - inkW / 2 + cap
+        let right = box.midX + inkW / 2 - cap
+        let top = box.midY - inkH / 2 + cap
+        let bottom = box.midY + inkH / 2 - cap
+        // The elbow sits where a checkmark's short arm meets the long one: 30% along.
+        let elbowX = left + (right - left) * 0.30
         // NSTextView is flipped (y grows downward), so the "dip then rise"
         // shape of a checkmark needs the larger y first (visually lower).
-        check.move(to: NSPoint(x: box.minX + side * 0.24, y: box.minY + side * 0.50))
-        check.line(to: NSPoint(x: box.minX + side * 0.42, y: box.minY + side * 0.70))
-        check.line(to: NSPoint(x: box.minX + side * 0.78, y: box.minY + side * 0.30))
+        check.move(to: NSPoint(x: left, y: bottom - (bottom - top) * 0.42))
+        check.line(to: NSPoint(x: elbowX, y: bottom))
+        check.line(to: NSPoint(x: right, y: top))
         checkColor.setStroke()
         check.stroke()
     }
+}
+
+/// A text view that tracks which ☐/☑ the pointer is over, so the layout manager can
+/// paint that one in its hover state.
+protocol TodoHoverHosting: AnyObject {
+    var hoveredMarkIndex: Int? { get }
 }
 
 /// Paints `TodoMarks.drawCheckbox` in place of the plain ☐/☑ glyph during
 /// layout — display-only, never touches the text storage, so it's safe to
 /// swap in on any NSTextView that already uses `TodoMarks` for hit-testing.
 nonisolated final class TodoAwareLayoutManager: NSLayoutManager {
+    /// Text on a ticked line draws in this instead of its own ink.
+    nonisolated override func showCGGlyphs(
+        _ glyphs: UnsafePointer<CGGlyph>,
+        positions: UnsafePointer<CGPoint>,
+        count glyphCount: Int,
+        font: NSFont,
+        textMatrix: CGAffineTransform,
+        attributes: [NSAttributedString.Key: Any],
+        in context: CGContext
+    ) {
+        if attributes[.todoDimmed] != nil {
+            let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let dim = dark
+                ? NSColor(calibratedRed: 0.50, green: 0.52, blue: 0.58, alpha: 1)
+                : NSColor(calibratedRed: 0.55, green: 0.57, blue: 0.62, alpha: 1)
+            context.setFillColor(dim.cgColor)
+        }
+        super.showCGGlyphs(
+            glyphs,
+            positions: positions,
+            count: glyphCount,
+            font: font,
+            textMatrix: textMatrix,
+            attributes: attributes,
+            in: context
+        )
+    }
+
     nonisolated override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
         guard let storage = textStorage else {
             super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
@@ -972,8 +1207,16 @@ nonisolated final class TodoAwareLayoutManager: NSLayoutManager {
                     var rect = boundingRect(forGlyphRange: markGlyphs, in: container)
                     rect.origin.x += origin.x
                     rect.origin.y += origin.y
-                    let font = (storage.attribute(.font, at: idx, effectiveRange: nil) as? NSFont) ?? .systemFont(ofSize: 16)
-                    TodoMarks.drawCheckbox(checked: ch == TodoMarks.checked, in: rect, font: font)
+                    let font = TodoMarks.bodyFont(in: storage, at: idx)
+                    let base = TodoMarks.baselineY(in: self, glyphs: markGlyphs) + origin.y
+                    let hovered = (container.textView as? TodoHoverHosting)?.hoveredMarkIndex == idx
+                    TodoMarks.drawCheckbox(
+                        checked: ch == TodoMarks.checked,
+                        hovered: hovered,
+                        in: rect,
+                        baselineY: base,
+                        font: font
+                    )
                 }
                 idx += 1
                 runStart = idx
@@ -985,7 +1228,20 @@ nonisolated final class TodoAwareLayoutManager: NSLayoutManager {
     }
 }
 
-final class GrowingTextView: NSTextView {
+final class GrowingTextView: NSTextView, TodoHoverHosting {
+    /// Fired after a ☐/☑ click flips the mark, with the checkbox square in view
+    /// coordinates so the canvas can bloom its halftone from exactly that spot.
+    var onToggleCheckbox: ((CGRect) -> Void)?
+    var onCheckboxHover: ((Bool) -> Void)?
+    /// Mark the pointer currently sits on — drawn brighter, and takes a pointing hand.
+    private(set) var hoveredMarkIndex: Int? {
+        didSet {
+            guard hoveredMarkIndex != oldValue else { return }
+            needsDisplay = true
+            onCheckboxHover?(hoveredMarkIndex != nil)
+        }
+    }
+    private var todoTracking: NSTrackingArea?
     /// Hard ceiling for auto-grown text cards.
     static let maxContentWidth: CGFloat = 640
     /// Default wrap column — paste / long runs grow height, not an endless line.
@@ -1042,23 +1298,85 @@ final class GrowingTextView: NSTextView {
         return TodoMarks.checkboxUTF16Index(in: self, at: local) != nil ? self : nil
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Tracking a checkbox hover needs mouse-moved events on this window.
+        window?.acceptsMouseMovedEvents = true
+        if window == nil { hoveredMarkIndex = nil }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let todoTracking { removeTrackingArea(todoTracking) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        todoTracking = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        updateTodoHover(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        hoveredMarkIndex = nil
+    }
+
+    private func updateTodoHover(at point: NSPoint) {
+        let idx = TodoMarks.checkboxUTF16Index(in: self, at: point)
+        hoveredMarkIndex = idx
+        if idx != nil { NSCursor.pointingHand.set() }
+    }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if let idx = TodoMarks.checkboxUTF16Index(in: self, at: point),
-           TodoMarks.toggle(in: self, at: idx)
-        {
-            didChangeText()
-            return
+        // Also refresh on the click itself: a press without a preceding move (after a
+        // scroll or a re-layout) must still be seen as a checkbox hit, not a card press.
+        updateTodoHover(at: point)
+        if let idx = TodoMarks.checkboxUTF16Index(in: self, at: point) {
+            let box = TodoMarks.checkboxRect(in: self, at: idx)
+            let willCheck = (string as NSString).character(at: idx) == TodoMarks.unchecked
+            if TodoMarks.toggle(in: self, at: idx) {
+                didChangeText()
+                // Ticking celebrates; clearing a tick is silent — no bloom on the way back.
+                if willCheck, let box { onToggleCheckbox?(box) }
+                return
+            }
         }
         super.mouseDown(with: event)
     }
 
     /// Keep foreground/font across Enter so list/todo lines don't flash default ink until ESC.
     /// Continues `• ` / `N. ` / `☐ ` on the new line; blank list item exits the list.
+    /// AppKit rebuilds typing attributes from the character before the caret, so putting
+    /// the caret after a mark handed the next keystroke the mark's inflated cell font —
+    /// the line grew again on the first letter typed. Fold any such font back to its body
+    /// size here, where every path (typing, paste, selection change) goes through.
+    override var typingAttributes: [NSAttributedString.Key: Any] {
+        get { super.typingAttributes }
+        set {
+            var attrs = newValue
+            if let font = attrs[.font] as? NSFont, font.familyName == TodoMarks.markFamily {
+                attrs[.font] = NSFont.systemFont(ofSize: TodoMarks.bodySize(fromMark: font))
+            }
+            super.typingAttributes = attrs
+        }
+    }
+
     override func insertNewline(_ sender: Any?) {
-        let keep = TextTypingStyle.capture(from: self)
+        var keep = TextTypingStyle.capture(from: self)
         let ns = string as NSString
         let loc = min(selectedRange().location, ns.length)
+        // Caret sitting straight after a mark carries the mark's inflated font — never
+        // let that become the next line's body size.
+        if loc > 0, TodoMarks.isMark(ns.character(at: loc - 1)), let storage = textStorage {
+            keep[.font] = TodoMarks.bodyFont(in: storage, at: loc - 1)
+        }
         let para = ns.paragraphRange(for: NSRange(location: loc, length: 0))
         let line = ns.substring(with: para)
             .trimmingCharacters(in: CharacterSet(charactersIn: "\n\r"))
@@ -1090,6 +1408,10 @@ final class GrowingTextView: NSTextView {
     }
 
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        // Belt to the typingAttributes brace: AppKit may seed the run from the character
+        // before the caret without going through the property, so a letter typed right
+        // after a mark would still land in the mark's inflated cell font.
+        demoteMarkFontAtCaret(replacementRange: replacementRange)
         // Replace "--" with "—" (em-dash) as the user types.
         let text: String = {
             if let s = insertString as? String { return s }
@@ -1104,6 +1426,20 @@ final class GrowingTextView: NSTextView {
         }
         super.insertText(insertString, replacementRange: replacementRange)
         if !text.isEmpty { AppSounds.playType() }
+    }
+
+    /// Fold the mark's cell font out of the typing attributes when the caret sits right
+    /// after a ☐/☑, so what gets typed is body-sized.
+    private func demoteMarkFontAtCaret(replacementRange: NSRange) {
+        guard let storage = textStorage else { return }
+        let ns = storage.string as NSString
+        let caret = replacementRange.location == NSNotFound
+            ? selectedRange().location
+            : replacementRange.location
+        guard caret > 0, caret <= ns.length, TodoMarks.isMark(ns.character(at: caret - 1)) else { return }
+        var attrs = typingAttributes
+        attrs[.font] = TodoMarks.bodyFont(in: storage, at: caret - 1)
+        typingAttributes = attrs
     }
 
     /// Replace the two characters before the caret with "—" when they are "--".
@@ -1380,30 +1716,46 @@ final class GrowingTextView: NSTextView {
     }
 }
 
-/// Radial Gaussian wavefront on a fixed halftone grid.
-/// Dots never move — only radius/alpha follow `A(t) · exp(-(r - R(t))² / 2σ²)`.
-/// Tuned to the 5-frame ref: big crest on the field → ring walks out & shrinks.
+/// Creation halftone: one Gaussian crest walks outward from the card's own
+/// rounded-rect contour, on a lattice locked to the canvas `DotGrid`.
+///
+/// Measured off the reference capture (30 fps, 2× display, canvas zoom 2 →
+/// `DotGrid` pitch 96 px): wave lattice pitch 32 px = `gridStep / 3` and phase
+/// locked to the grid; crest starts on the contour and travels ~1.6 × the field's
+/// long side; front stays parallel to the contour (the diagonal / axis reach ratio
+/// falls 1.24 → 1.10 as the offset grows, which is exactly a rect offset, not a
+/// circle and not a square); peak dot diameter 28 px → 9 px over the run; crest
+/// FWHM 88 px → 32 px; total run ~0.78 s.
 struct TextGaussianWave: View {
     /// Field geometry snapshot in screen space (at creation).
     let fieldFrame: CGRect
+    /// Screen-space corner radius of the card's clip shape (0 for ink).
+    var cornerRadius: CGFloat = 8
     let startDate: Date
-    var duration: TimeInterval = 0.58
+    var duration: TimeInterval = 0.78
     /// Canvas grid pitch in screen space (`24 * zoom`).
     var gridStep: CGFloat = 24
+    /// Screen-space origin of the first DotGrid node (camera remainder phase).
+    var gridOrigin: CGPoint = .zero
+    /// Widens (or narrows) how far the crest travels past the contour.
+    var spread: CGFloat = 1
     var onComplete: (() -> Void)?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var scheme
     @State private var didComplete = false
 
-    private var blockCenter: CGPoint {
-        CGPoint(x: fieldFrame.midX, y: fieldFrame.midY)
-    }
+    /// Lattice pitch: exactly a third of the canvas grid, so every third node
+    /// coincides with a resting `DotGrid` dot.
+    private var step: CGFloat { max(6, gridStep / 3) }
 
-    /// Frame 5 crest sits further out; draw buffer a bit past that.
-    private var maxRadius: CGFloat {
-        max(fieldFrame.width, fieldFrame.height) * 6.2
-    }
+    /// How far past the contour the crest ends up. Constant, not field-derived: in the
+    /// reference the ink burst (field 165 pt) and the checkbox burst (field ~15 pt) both
+    /// travel ~7 canvas-grid steps at the same ~29 px/frame, so the bloom is the same
+    /// size whatever it grows out of.
+    private var travel: CGFloat { gridStep * 7 * spread }
+
+    private var pad: CGFloat { travel + step * 3 }
 
     var body: some View {
         if reduceMotion {
@@ -1414,16 +1766,15 @@ struct TextGaussianWave: View {
             TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
                 let raw = context.date.timeIntervalSince(startDate) / duration
                 let t = CGFloat(min(1, max(0, raw)))
-                Canvas { ctx, size in
-                    let local = CGPoint(x: size.width / 2, y: size.height / 2)
-                    draw(ctx: ctx, center: local, maxRadius: maxRadius, t: t)
+                Canvas { ctx, _ in
+                    draw(ctx: ctx, t: t)
                 }
                 .onChange(of: t) { _, value in
                     if value >= 1 { finish() }
                 }
             }
-            .frame(width: fieldFrame.width + maxRadius * 2, height: fieldFrame.height + maxRadius * 2)
-            .position(blockCenter)
+            .frame(width: fieldFrame.width + pad * 2, height: fieldFrame.height + pad * 2)
+            .position(x: fieldFrame.midX, y: fieldFrame.midY)
             .allowsHitTesting(false)
             .onAppear {
                 if Date.now.timeIntervalSince(startDate) >= duration { finish() }
@@ -1437,37 +1788,41 @@ struct TextGaussianWave: View {
         onComplete?()
     }
 
-    private func draw(ctx: GraphicsContext, center: CGPoint, maxRadius: CGFloat, t: CGFloat) {
-        // Denser than the canvas DotGrid — refs pack balls almost touching at the crest.
-        let step = max(9, gridStep * 0.58)
-        let field = max(fieldFrame.width, fieldFrame.height)
-        let fieldR = field * 0.55
-        // Frame 1–2: crest sits on the field (balls crawl onto the box).
-        // Frame 5: crest ~3.5–4× field out.
-        let rStart = fieldR * 0.55
-        let rEnd = field * 4.8
-        let sigma = step * 1.7
-        // Linger near the field, then the ring walks out (matches frames 1→5).
-        let ease = pow(t, 1.35)
-        let crestR = rStart + (rEnd - rStart) * ease
-        // Frame 1 huge & packed; frame 5 clearly smaller + fading.
-        let amp = (1 - 0.62 * ease) * (1 - pow(t, 2.4))
-        // Peak ≈ step → neighbors almost kiss (original’s tight start).
-        let sizePeak: CGFloat = step * 1.02
-        let sizeFloor: CGFloat = max(0.85, step * 0.05)
+    private func draw(ctx: GraphicsContext, t: CGFloat) {
+        let half = CGSize(width: fieldFrame.width * 0.5, height: fieldFrame.height * 0.5)
+        let radius = min(cornerRadius, min(half.width, half.height))
+        // Crest offset outside the contour; the capture's front advances at a
+        // near-constant speed, so this stays linear in t.
+        let crest = travel * t
+        // The ring tightens as it goes: ~1.05 → ~0.44 lattice steps of sigma.
+        let sigma = step * (1.05 + (0.44 - 1.05) * t)
+        // Dot diameter decays close to (1 - t)^1.4 in the capture.
+        let amp = pow(max(0, 1 - t), 1.4)
+        let sizePeak = step * 0.92
+        let sizeFloor = max(0.85, step * 0.05)
 
-        var x = -maxRadius
-        while x <= maxRadius {
-            var y = -maxRadius
-            while y <= maxRadius {
-                let r = hypot(x, y)
-                if r <= maxRadius {
-                    let gauss = exp(-pow(r - crestR, 2) / (2 * sigma * sigma))
-                    let weight = gauss * amp
-                    let dotSize = sizeFloor + (sizePeak - sizeFloor) * weight
-                    let alpha = weight * 0.88
-                    if weight > 0.03, dotSize > 0.4 {
-                        let p = CGPoint(x: center.x + x, y: center.y + y)
+        let bounds = fieldFrame.insetBy(dx: -pad, dy: -pad)
+        var gx = gridOrigin.x
+        if gx > bounds.minX { gx -= step * ceil((gx - bounds.minX) / step) }
+        while gx <= bounds.maxX {
+            var gy = gridOrigin.y
+            if gy > bounds.minY { gy -= step * ceil((gy - bounds.minY) / step) }
+            while gy <= bounds.maxY {
+                let local = CGPoint(x: gx - fieldFrame.midX, y: gy - fieldFrame.midY)
+                // Distance to the contour, positive outside — the front is parallel
+                // to the card's real shape, not a circle around its center.
+                let outside = -ShapeSDF.signedRoundRect(local, half: half, radius: radius)
+                let band = exp(-pow(outside - crest, 2) / (2 * sigma * sigma))
+                let weight = amp * band
+                if weight > 0.03 {
+                    let dotSize = sizeFloor + (sizePeak - sizeFloor) * min(1, weight)
+                    let alpha = min(1, weight) * 0.9
+                    if dotSize > 0.4 {
+                        // Canvas is centered on field mid — convert screen → local canvas.
+                        let p = CGPoint(
+                            x: (fieldFrame.width + pad * 2) * 0.5 + local.x,
+                            y: (fieldFrame.height + pad * 2) * 0.5 + local.y
+                        )
                         let rect = CGRect(
                             x: p.x - dotSize / 2,
                             y: p.y - dotSize / 2,
@@ -1477,9 +1832,9 @@ struct TextGaussianWave: View {
                         ctx.fill(Path(ellipseIn: rect), with: .color(Theme.selectionNotch(scheme).opacity(alpha)))
                     }
                 }
-                y += step
+                gy += step
             }
-            x += step
+            gx += step
         }
     }
 }
@@ -1604,7 +1959,7 @@ struct DeleteHalftoneWave: View {
 }
 
 /// Analytic SDFs for card clip shapes (positive = inside).
-private enum ShapeSDF {
+enum ShapeSDF {
     /// Inigo Quilez round-box, negated so >0 is inside the shape.
     static func signedRoundRect(_ p: CGPoint, half: CGSize, radius: CGFloat) -> CGFloat {
         let r = min(radius, min(half.width, half.height))

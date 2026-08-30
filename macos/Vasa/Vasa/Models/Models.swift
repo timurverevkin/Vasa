@@ -29,6 +29,11 @@ struct TextWaveEvent: Equatable {
     var y: Double
     var width: Double = 34
     var height: Double = 34
+    /// World-space corner radius of the card's real clip shape.
+    var cornerRadius: Double = 8
+    /// Multiplies how far the crest travels past the contour. Text blocks bloom a
+    /// touch wider than ink; 1.0 is the distance measured off the ink reference.
+    var spread: Double = 1
     /// Screen-space animation clock — frozen at creation so pan/zoom mid-wave doesn't restart it.
     var startedAt: Date = .now
 }
@@ -146,6 +151,16 @@ struct Card: Identifiable, Codable, Hashable {
         CGRect(x: x, y: y, width: previewWidth, height: previewHeight)
     }
 
+    /// Extra world-space grab margin for ink cards: a straight stroke's bounds are only
+    /// a few points tall, which makes the card near-impossible to hit with the pointer.
+    static let inkGrabPad: CGFloat = 10
+
+    /// Frame used for pointer hit-testing — same as `frame` except ink cards, which get
+    /// a grab margin so thin strokes stay selectable and draggable.
+    var hitFrame: CGRect {
+        kind == .draw ? frame.insetBy(dx: -Card.inkGrabPad, dy: -Card.inkGrabPad) : frame
+    }
+
     var displayTitle: String {
         title ?? alt ?? hostname ?? kind.rawValue
     }
@@ -252,6 +267,18 @@ struct Lesson: Identifiable, Codable, Hashable {
     var thumb: String?
     /// Relative folder under the projects library, e.g. `Studio/Visual Research`.
     var path: String? = nil
+
+    /// Image sources on the board, in card order — video cards contribute their poster.
+    /// Used by the sidebar cover to step through the board's media.
+    var mediaSources: [String] {
+        cards.compactMap { card in
+            switch card.kind {
+            case .image: return card.src.flatMap { $0.isEmpty ? nil : $0 }
+            case .video: return card.poster.flatMap { $0.isEmpty ? nil : $0 }
+            default: return nil
+            }
+        }
+    }
 }
 
 struct Subject: Identifiable, Codable, Hashable {
