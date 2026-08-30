@@ -29,25 +29,28 @@ struct RootView: View {
         ZStack(alignment: .topLeading) {
             CanvasView()
             if app.library.sidebarOpen {
-                if app.settingsOpen {
-                    SettingsView()
-                        .padding(10)
-                        .zIndex(600)
-                        .contentShape(Rectangle())
-                        .transition(Self.sidebarTransition)
-                } else {
-                    SidebarView()
-                        .padding(10)
-                        .zIndex(600)
-                        .contentShape(Rectangle())
-                        .transition(Self.sidebarTransition)
+                // One panel that swaps its content: the slide-in belongs to opening the
+                // sidebar, not to stepping into settings. Sharing the container (and
+                // killing the animation for that flag) makes the swap instant instead of
+                // sliding a second opaque panel over the first.
+                ZStack(alignment: .topLeading) {
+                    if app.settingsOpen {
+                        SettingsView()
+                    } else {
+                        SidebarView()
+                    }
                 }
+                .animation(nil, value: app.settingsOpen)
+                .padding(10)
+                .zIndex(600)
+                .contentShape(Rectangle())
+                .transition(Self.sidebarTransition)
             } else if app.settings.showChrome {
                 ProjectChip()
+                    .transition(Self.chipTransition)
                     .padding(.top, 14)
                     .padding(.leading, 14)
                     .zIndex(600)
-                    .transition(Self.chipTransition)
             }
             if let id = app.boardMenuID, let lesson = app.library.lessons.first(where: { $0.id == id }) {
                 GeometryReader { geo in
@@ -77,9 +80,6 @@ struct RootView: View {
             if app.aiArrangePromptOpen { ArrangeAIPrompt().zIndex(705) }
             if app.providerSettingsOpen { ProviderSettingsPanel().zIndex(720) }
             if let menu = app.menu { ItemMenuOverlay(anchor: menu).zIndex(700) }
-            ProjectWave(token: app.boardWave)
-                .allowsHitTesting(false)
-                .zIndex(50)
             if app.askAICardID != nil {
                 ChatPanel()
                     .zIndex(750)
@@ -92,18 +92,25 @@ struct RootView: View {
         .preferredColorScheme(app.settings.appearance.colorScheme)
         // Keep chrome out of the ZStack hit pyramid — full-frame wrappers were eating
         // sidebar clicks (search / settings / toggles felt delayed or dead).
-        .overlay(alignment: .topLeading) {
+        .overlay(alignment: .top) {
+            // Centered on the window, not on the canvas area: the bar must not shift
+            // when the sidebar opens or closes. `ignoresSafeArea` puts it on the same
+            // 14pt line as the zoom controls — without it the titlebar inset pushed the
+            // bar a row lower than everything else in the top chrome.
             if app.tool == .draw, app.settings.showChrome, app.noteOpenID == nil {
                 DrawInkBar()
+                    .blocksWindowDrag()
                     .padding(.top, 14)
-                    .padding(.leading, app.library.sidebarOpen ? 276 : 14)
+                    .ignoresSafeArea(edges: .top)
                     .zIndex(800)
             }
         }
         .overlay(alignment: .topTrailing) {
-            if app.settings.showChrome, app.noteOpenID == nil {
+            if app.settings.showChrome, app.noteOpenID == nil, app.lightbox == nil {
                 ZoomControls()
-                    .padding(.top, app.library.sidebarOpen ? 10 : 14)
+                    // Constant inset — tying it to the sidebar made the controls hop
+                    // 4pt every time the sidebar opened or closed.
+                    .padding(.top, 14)
                     .padding(.trailing, 14)
                     .ignoresSafeArea(edges: .top)
             }
@@ -189,8 +196,8 @@ struct RootView: View {
                     app.lightbox = LightboxItem(src: src, alt: card.alt, bytes: Theme.fileBytes(src))
                     return true
                 }
-                if card.kind == .video, let poster = card.poster {
-                    app.lightbox = LightboxItem(src: poster, alt: card.title, videoSrc: card.src)
+                if card.kind == .video {
+                    app.openVideoPreview(card)
                     return true
                 }
             }
@@ -199,6 +206,7 @@ struct RootView: View {
         }
         if event.keyCode == 53 {
             if app.handleTextToolEscape() { return true }
+            if app.handleDrawEscape() { return true }
             app.dismissOverlays()
             return true
         }
@@ -416,28 +424,106 @@ struct LinkPrompt: View {
     }
 }
 
+/// Halftone bloom on project open — the window-scale sibling of `TextGaussianWave`.
+/// A lit front runs from the canvas center out past the corners; everything behind it
+/// stays lit and the whole field fades out together.
+///
+/// Measured off the reference capture (30 fps, 2× display): lattice pitch 32 px = 16 pt,
+/// peak dot ≈ the pitch, the front clears the corners in ~0.21 s and the field is gone at
+/// ~0.5 s; behind the front the dot weight follows ≈ 0.8 · (1 - t)^0.9 (coverage 0.43 →
+/// 0.01 across the run), and the crest itself is only marginally brighter than the
+/// interior — this is a filling bloom, not a thin ring.
 struct ProjectWave: View {
     var token: Int
-    @State private var scale = 0.2
-    @State private var opacity = 0.0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var scheme
+
+    /// Nil while idle so no timeline runs between projects.
+    @State private var startedAt: Date?
+
+    private let duration: TimeInterval = 0.5
+    private let step: CGFloat = 16
+    /// Peak diameter equals the lattice pitch — fully swollen dots touch, no gaps.
+    private var peakDot: CGFloat { step }
+    private let baseDot: CGFloat = 1.5
+
+    /// Fraction of the run the front needs to clear the corners (0.21 s of 0.5 s).
+    private let frontSpan: CGFloat = 0.42
+    /// Soft edge on the front, as a fraction of the half-diagonal.
+    private let frontFeather: CGFloat = 0.14
+    /// Weight of the lit field right behind the front, and its decay exponent.
+    private let fieldAmp: CGFloat = 0.80
+    private let fieldDecay: CGFloat = 0.9
+    /// The crest reads only slightly brighter than the interior.
+    private let crestBoost: CGFloat = 0.06
+    /// Push the front past the corners so it fully leaves the viewport.
+    private let radiusOvershoot: CGFloat = 1.15
 
     var body: some View {
-        Circle()
-            .stroke(Theme.ink.opacity(0.16), lineWidth: 18)
-            .scaleEffect(scale)
-            .opacity(opacity)
-            .frame(width: 240, height: 240)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .allowsHitTesting(false)
-            .onChange(of: token) { _, _ in
-                scale = 0.12
-                opacity = 0.45
-                withAnimation(.easeOut(duration: 0.72)) {
-                    scale = 6
-                    opacity = 0
+        GeometryReader { geo in
+            Group {
+                if let startedAt {
+                    TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
+                        let t = CGFloat(min(1, max(0, context.date.timeIntervalSince(startedAt) / duration)))
+                        Canvas { ctx, size in
+                            draw(ctx: ctx, size: size, t: t)
+                        }
+                        .onChange(of: t) { _, value in
+                            if value >= 1 { self.startedAt = nil }
+                        }
+                    }
+                } else {
+                    Color.clear
                 }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+        }
+        .allowsHitTesting(false)
+        .onChange(of: token) { _, _ in
+            guard !reduceMotion else { return }
+            startedAt = .now
+        }
     }
+
+    private func draw(ctx: GraphicsContext, size: CGSize, t: CGFloat) {
+        // Origin is the canvas viewport center — the same point the camera is centered
+        // on. The sidebar floats above the canvas, so it must not shift this.
+        let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        let maxDist = max(1, hypot(size.width, size.height) / 2)
+        // Dot positions never move; only each dot's diameter is modulated. The front
+        // advances at a constant speed and clears the corners well before the run ends —
+        // the rest of the run is the whole field fading out at once.
+        let front = maxDist * radiusOvershoot * min(1, t / frontSpan)
+        let feather = maxDist * frontFeather
+        // Resting state belongs to `DotGrid`, which is already painted underneath, so the
+        // field fades back out at the end instead of leaving a second lattice behind.
+        let amp = fieldAmp * pow(max(0, 1 - t), fieldDecay)
+        let color = Theme.primaryInk(scheme)
+
+        var x = center.x.truncatingRemainder(dividingBy: step)
+        while x < size.width {
+            var y = center.y.truncatingRemainder(dividingBy: step)
+            while y < size.height {
+                let d = hypot(x - center.x, y - center.y)
+                // 1 behind the front, fading to 0 just outside it.
+                let lit = 1 - ShapeSDF.smoothstep(front - feather, front + feather * 0.35, d)
+                let crest = exp(-0.5 * pow((d - front) / (feather * 0.7), 2))
+                let weight = amp * (lit + crestBoost * crest)
+                if weight > 0.03 {
+                    let dot = baseDot + (peakDot - baseDot) * min(1, weight)
+                    let alpha = min(1, weight) * 0.42
+                    let rect = CGRect(x: x - dot / 2, y: y - dot / 2, width: dot, height: dot)
+                    ctx.fill(Path(ellipseIn: rect), with: .color(color.opacity(alpha)))
+                }
+                y += step
+            }
+            x += step
+        }
+    }
+
+    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }
+
+    private func clamp01(_ v: CGFloat) -> CGFloat { min(1, max(0, v)) }
 }
 
 struct HiddenTrafficLights: NSViewRepresentable {
@@ -460,6 +546,9 @@ struct HiddenTrafficLights: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.title = ""
         window.styleMask.insert(.fullSizeContentView)
+        // Dragging is owned by `WindowMoveStrip` alone: with background dragging on, a
+        // drag that started on chrome (the ink-thickness slider) moved the window too.
+        window.isMovableByWindowBackground = false
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
@@ -488,6 +577,84 @@ struct HiddenTrafficLights: NSViewRepresentable {
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+/// Mouse handling for a slider that sits inside the window's titlebar band. AppKit decides
+/// window-dragging from the hit view at mouseDown, before a SwiftUI `DragGesture` ever runs,
+/// so dragging the ink-thickness slider moved the whole window. This view takes the events
+/// itself and reports the position back, and answers `false` to `mouseDownCanMoveWindow`.
+struct SliderDragCatcher: NSViewRepresentable {
+    /// Position of the pointer inside the view, in points from its left edge.
+    var onDrag: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = Catcher()
+        view.onDrag = onDrag
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? Catcher)?.onDrag = onDrag
+    }
+
+    final class Catcher: NSView {
+        var onDrag: ((CGFloat) -> Void)?
+
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        private func report(_ event: NSEvent) {
+            onDrag?(convert(event.locationInWindow, from: nil).x)
+        }
+
+        override func mouseDown(with event: NSEvent) { report(event) }
+        override func mouseDragged(with event: NSEvent) { report(event) }
+        override func mouseUp(with event: NSEvent) { report(event) }
+    }
+}
+
+/// Suspends window dragging while the pointer is over a control.
+///
+/// The ink bar sits inside the titlebar band, where AppKit starts a window drag from the
+/// hit view's `mouseDownCanMoveWindow` before any SwiftUI gesture runs — and `NSHostingView`
+/// answers every `hitTest` with itself, so a nested `NSViewRepresentable` can never be that
+/// hit view and can never change the answer. `NSWindow.isMovable` is the supported lever:
+/// off while the pointer is on the control, on again the moment it leaves.
+private struct WindowDragSuspender: ViewModifier {
+    @State private var window: NSWindow?
+
+    func body(content: Content) -> some View {
+        content
+            .background(WindowReader { window = $0 })
+            .onHover { inside in
+                (window ?? NSApp.keyWindow)?.isMovable = !inside
+            }
+            .onDisappear {
+                (window ?? NSApp.keyWindow)?.isMovable = true
+            }
+    }
+}
+
+extension View {
+    /// A press inside this view never drags the window.
+    func blocksWindowDrag() -> some View {
+        modifier(WindowDragSuspender())
+    }
+}
+
+/// Hands back the window the view landed in.
+private struct WindowReader: NSViewRepresentable {
+    var onResolve: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { onResolve(view.window) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { onResolve(nsView.window) }
     }
 }
 

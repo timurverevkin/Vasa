@@ -255,12 +255,13 @@ struct BoardMenuCard: View {
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.secondaryInk(scheme))
                 Spacer()
+                // Same plate as the preview header: square hairline outline, no fill.
                 Text(Format.bytes(lesson.bytes))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Theme.secondaryInk(scheme))
                     .padding(.horizontal, 7)
-                    .frame(height: 20)
-                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.hairline(scheme)))
+                    .padding(.vertical, 3)
+                    .overlay(Rectangle().stroke(Theme.hairline(scheme), lineWidth: 1))
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)

@@ -7,6 +7,8 @@ struct CardView: View {
     @Environment(AppModel.self) private var app
     let card: Card
     let selected: Bool
+    /// One-shot press when an ink object takes its first stroke: swells, then settles back.
+    @State private var pressScale: CGFloat = 1
 
     var body: some View {
         let clipRadius = contentClipRadius
@@ -51,7 +53,19 @@ struct CardView: View {
                     .allowsHitTesting(false)
                 }
             }
-            .contentShape(Rectangle())
+            .scaleEffect(pressScale)
+            .onChange(of: app.inkPressID) { _, value in
+                guard value == card.id else { return }
+                withAnimation(.spring(response: 0.18, dampingFraction: 0.6)) {
+                    pressScale = 1.06
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.72)) {
+                        pressScale = 1
+                    }
+                }
+            }
+            .contentShape(GrabShape(pad: card.kind == .draw ? Card.inkGrabPad : 0))
             .position(x: card.previewWidth / 2 + card.x, y: card.previewHeight / 2 + card.y)
             // Select on press (not delayed tap). Pairing single+double onTapGesture
             // waits for the double-click timeout (~300ms) before selecting.
@@ -62,7 +76,12 @@ struct CardView: View {
             // hand its location to beginTextEditing — the click never reaches the NSTextView
             // itself (not hit-testable until `isEditable` flips on the next render pass), so
             // without this the caret would silently stay wherever the last edit left it.
-            .simultaneousGesture(SpatialTapGesture(count: 2).onEnded { value in open(at: value.location) })
+            .simultaneousGesture(
+                SpatialTapGesture(count: 2).onEnded { value in
+                    guard !pointerOnCheckbox else { return }
+                    open(at: value.location)
+                }
+            )
             .allowsHitTesting(app.tool != .draw)
     }
 
@@ -75,6 +94,12 @@ struct CardView: View {
 
     private var blocksCardDrag: Bool {
         textBlocksCardDrag || app.tool == .draw || (card.kind == .group && app.editingGroupID == card.id)
+            || app.todoHitCardID == card.id
+    }
+
+    /// Pointer is on one of this card's checkboxes: the click belongs to the box alone.
+    private var pointerOnCheckbox: Bool {
+        app.todoHitCardID == card.id
     }
 
     private var isEditingText: Bool {
@@ -86,13 +111,28 @@ struct CardView: View {
         switch card.kind {
         case .text: TextCardView(card: card)
         case .note: NoteCardView(card: card)
-        case .image: ImageCardView(card: card)
+        case .image:
+            if app.mediaReady {
+                ImageCardView(card: card)
+            } else {
+                MediaPending(radius: Format.cardRadius)
+            }
         case .link: LinkCardView(card: card)
         case .audio: AudioCardView(card: card)
-        case .video: VideoCardView(card: card)
+        case .video:
+            if app.mediaReady {
+                VideoCardView(card: card)
+            } else {
+                MediaPending(radius: Format.cardRadius)
+            }
         case .shortcut, .folder: ShortcutCardView(card: card)
         case .draw: DrawCardView(card: card)
-        case .youtube: YouTubeCardView(card: card)
+        case .youtube:
+            if app.mediaReady {
+                YouTubeCardView(card: card)
+            } else {
+                MediaPending(radius: Format.cardRadius)
+            }
         case .group: GroupCardView(card: card)
         }
     }
@@ -192,6 +232,14 @@ struct CardView: View {
                         } else if app.selectedIDs == [card.id] {
                             // Already drilled into this member — a re-click keeps it narrowed.
                             pressTargetID = card.id
+                        } else if app.selectedIDs.count == 1,
+                                  let current = app.selectedIDs.first,
+                                  app.card(current)?.groupId == gid {
+                            // Already inside this group on a sibling — stay drilled in and
+                            // move the pick to the clicked member instead of jumping back
+                            // out to the whole group.
+                            pressTargetID = card.id
+                            app.select([card.id])
                         } else {
                             pressTargetID = gid
                             app.select([gid])
@@ -416,7 +464,17 @@ struct TextCardView: View {
             onSelectionChange: { range, screenRect in
                 app.updateTextSelection(range: range, screenRect: screenRect)
             },
-            onBind: { app.activeCanvasTextView = $0 }
+            onBind: { app.activeCanvasTextView = $0 },
+            onToggleCheckbox: { box in
+                app.celebrateCheckbox(cardID: card.id, boxRect: box)
+            },
+            onCheckboxHover: { over in
+                if over {
+                    app.todoHitCardID = card.id
+                } else if app.todoHitCardID == card.id {
+                    app.todoHitCardID = nil
+                }
+            }
         )
         .padding(GrowingTextView.chromeGap)
         .frame(width: card.width, height: card.height, alignment: .topLeading)
@@ -496,7 +554,15 @@ struct TextCardView: View {
             size: fontSize,
             ink: card.color.map { NSColor.vasa(hex: $0) } ?? Theme.defaultInkNSColor(scheme)
         )
-        let hug = CanvasTextEditor.hugSize(for: attr)
+        // ☑ and ☐ can have different advances, so measuring the text as-is made ticking a
+        // box resize the card. Measure every mark as ☐ — the size then never depends on
+        // which boxes are checked.
+        let measured = NSMutableAttributedString(attributedString: attr)
+        let marks = measured.string as NSString
+        for i in 0..<marks.length where marks.character(at: i) == TodoMarks.checked {
+            measured.replaceCharacters(in: NSRange(location: i, length: 1), with: "\u{2610}")
+        }
+        let hug = CanvasTextEditor.hugSize(for: measured)
         // chromeGap is outside the editor measure — keep the card big enough for padding.
         let pad = Double(GrowingTextView.chromeGap * 2)
         let nextW = Double(hug.width) + pad
@@ -953,14 +1019,15 @@ struct VideoCardView: View {
                         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
                 }
             }
+            // Bottom-leading, same corner as the YouTube card's control (and YouTube's own).
             if !playing || Playback.shared.lastError != nil {
                 PlayControl(playing: false, large: false) { app.togglePlay(card.id) }
-                    .padding(.bottom, 16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             } else if selected {
                 PlayControl(playing: true, large: false) { app.togglePlay(card.id) }
-                    .padding(.bottom, 16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1078,16 +1145,13 @@ struct GroupCardView: View {
                 .fill(Theme.groupFill(scheme, tint: card.color))
             Group {
                 if renaming {
+                    // Edits in place: same font, color and position as the label, with
+                    // nothing but a caret to show it is editable — no field chrome, no
+                    // background, so the title never shifts when renaming starts.
                     TextField("Group", text: $draft)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Theme.primaryInk(scheme))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(
-                            Theme.cardSurface(scheme).opacity(0.92),
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        )
+                        .foregroundStyle(Theme.groupTitle(scheme, tint: card.color))
                         .focused($titleFocused)
                         .onSubmit { app.commitGroupRename(card.id, title: draft) }
                         .onExitCommand { app.commitGroupRename(card.id, title: draft) }
@@ -1107,6 +1171,10 @@ struct GroupCardView: View {
                 DispatchQueue.main.async { titleFocused = true }
             } else {
                 titleFocused = false
+                // Rename can also end from the outside — a click on the canvas, another
+                // card taking the selection. Commit the draft there too, so Return is
+                // never the only way to keep what was typed.
+                app.commitGroupRename(card.id, title: draft)
             }
         }
         .onChange(of: titleFocused) { _, focused in
@@ -1114,6 +1182,14 @@ struct GroupCardView: View {
                 app.commitGroupRename(card.id, title: draft)
             }
         }
+    }
+}
+
+/// Card frame grown by `pad` for hit-testing only — ink cards need a grab margin.
+private struct GrabShape: Shape {
+    let pad: CGFloat
+    func path(in rect: CGRect) -> Path {
+        Path(rect.insetBy(dx: -pad, dy: -pad))
     }
 }
 
@@ -1142,22 +1218,29 @@ struct DrawCardView: View {
 struct YouTubeCardView: View {
     @Environment(AppModel.self) private var app
     let card: Card
+    @State private var embedReady = false
     var playing: Bool { app.playingID == card.id }
 
     var body: some View {
         ZStack {
+            // Poster stays underneath while the embed loads: a fresh WKWebView paints
+            // white for a beat, which flashed through the card on every play.
+            Color.black
+                .overlay {
+                    RemoteImage(src: "https://img.youtube.com/vi/\(card.videoId ?? "")/hqdefault.jpg")
+                        .scaledToFill()
+                }
             if playing, let id = card.videoId {
-                YouTubeEmbed(videoID: id, autoplay: true)
+                YouTubeEmbed(videoID: id, autoplay: true) { embedReady = true }
+                    .opacity(embedReady ? 1 : 0)
             } else {
-                Color.black
-                    .overlay {
-                        RemoteImage(src: "https://img.youtube.com/vi/\(card.videoId ?? "")/hqdefault.jpg")
-                            .scaledToFill()
-                    }
                 PlayControl(playing: false, large: true) { app.setPlaying(card.id) }
-                    .padding(.bottom, 16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             }
+        }
+        .onChange(of: playing) { _, value in
+            if !value { embedReady = false }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(CardRoundedRect(radius: Format.cardRadius))
@@ -1181,9 +1264,12 @@ struct PlayControl: View {
                 .foregroundStyle(scheme == .dark ? Color.white : Theme.ink)
                 .offset(x: playing ? 0 : 1)
                 .frame(width: side, height: side)
-                .background(scheme == .dark ? Color(red: 0.28, green: 0.28, blue: 0.30) : Color.white, in: Circle())
+                .background(
+                    scheme == .dark ? Color(red: 0.28, green: 0.28, blue: 0.30) : Color.white,
+                    in: RoundedRectangle(cornerRadius: side * 0.3, style: .continuous)
+                )
                 .shadow(color: .black.opacity(scheme == .dark ? 0.4 : 0.12), radius: 6, y: 2)
-                .contentShape(Circle())
+                .contentShape(RoundedRectangle(cornerRadius: side * 0.3, style: .continuous))
         }
         .buttonStyle(.plain)
     }
@@ -1193,6 +1279,17 @@ struct RemoteImage: View {
     let src: String
     var contentMode: ContentMode = .fill
     @State private var localImage: NSImage?
+
+    init(src: String, contentMode: ContentMode = .fill) {
+        self.src = src
+        self.contentMode = contentMode
+        // Seed from the decode cache so an image seen earlier this session paints on
+        // the first frame — reopening a board or re-rendering the sidebar must never
+        // flash the placeholder again.
+        _localImage = State(
+            initialValue: ImageMedia.cachedThumbnail(src: src, maxPixelSize: ImageMedia.maxSide * 2)
+        )
+    }
 
     var body: some View {
         Group {
@@ -1223,6 +1320,18 @@ struct RemoteImage: View {
     func scaledToFill() -> RemoteImage { RemoteImage(src: src, contentMode: .fill) }
 }
 
+/// Quiet stand-in while a freshly opened board still holds its media back — no pulse,
+/// no decode, just the card's own surface so the layout reads correctly.
+struct MediaPending: View {
+    var radius: CGFloat = Format.cardRadius
+    @Environment(\.colorScheme) private var scheme
+    var body: some View {
+        CardRoundedRect(radius: radius)
+            .fill(Theme.cardSurface(scheme))
+            .overlay(CardRoundedRect(radius: radius).stroke(Theme.hairline(scheme)))
+    }
+}
+
 struct GhostPlaceholder: View {
     @State private var pulse = false
     var body: some View {
@@ -1246,8 +1355,10 @@ struct GhostPlaceholder: View {
 struct YouTubeEmbed: NSViewRepresentable {
     let videoID: String
     var autoplay: Bool = true
+    /// Fires once the embed page has painted, so the card can drop its poster.
+    var onReady: () -> Void = {}
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(onReady: onReady) }
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -1255,18 +1366,31 @@ struct YouTubeEmbed: NSViewRepresentable {
         config.allowsAirPlayForMediaPlayback = true
         let view = WKWebView(frame: .zero, configuration: config)
         view.setValue(false, forKey: "drawsBackground")
+        // Anything the page hasn't painted yet reads black, not the default white.
+        view.underPageBackgroundColor = .black
+        view.navigationDelegate = context.coordinator
         load(into: view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
+        context.coordinator.onReady = onReady
         if context.coordinator.loadedID != videoID {
             load(into: view, coordinator: context.coordinator)
         }
     }
 
-    final class Coordinator {
+    final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedID: String?
+        var onReady: () -> Void
+
+        init(onReady: @escaping () -> Void) {
+            self.onReady = onReady
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            onReady()
+        }
     }
 
     private func load(into view: WKWebView, coordinator: Coordinator) {

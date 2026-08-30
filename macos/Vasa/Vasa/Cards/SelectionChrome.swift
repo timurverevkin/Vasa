@@ -506,11 +506,13 @@ struct ColorSwatchButton: View {
 /// Default / unset color glyph — outlined circle, half filled on a 45° diagonal (dark below).
 struct HalfFilledColorGlyph: View {
     var size: CGFloat = 16
+    /// Drawn on a dark filled cell — glyph flips to white ink on a dark disc.
+    var inverted = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         Canvas { context, canvasSize in
-            let ink = scheme == .dark ? Color.white : Theme.ink
+            let ink = (inverted || scheme == .dark) ? Color.white : Theme.ink
             let s = min(canvasSize.width, canvasSize.height)
             let pad = s * 0.06
             let rect = CGRect(
@@ -522,7 +524,10 @@ struct HalfFilledColorGlyph: View {
             let center = CGPoint(x: rect.midX, y: rect.midY)
             let radius = rect.width / 2
 
-            context.fill(Path(ellipseIn: rect), with: .color(scheme == .dark ? Color.black.opacity(0.35) : .white))
+            let disc: Color = inverted
+                ? Theme.ink
+                : (scheme == .dark ? Color.black.opacity(0.35) : .white)
+            context.fill(Path(ellipseIn: rect), with: .color(disc))
 
             // 45° split from top-left to bottom-right. Filled half sits below the line.
             var half = Path()
@@ -556,16 +561,16 @@ private struct ResetColorSwatch: View {
 
     var body: some View {
         Button(action: action) {
-            HalfFilledColorGlyph(size: 14)
+            HalfFilledColorGlyph(size: 14, inverted: selected)
                 .frame(width: 16, height: 16)
                 .padding(6)
                 .background(
-                    selected || hover
-                        ? (selected
-                            ? Theme.ink.opacity(scheme == .dark ? 0.35 : 0.08)
-                            : (scheme == .dark ? Color.white.opacity(0.12) : Theme.hover))
-                        : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    selected
+                        ? Theme.selectFill(scheme)
+                        : (hover
+                            ? (scheme == .dark ? Color.white.opacity(0.12) : Theme.hover)
+                            : Color.clear),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                 )
                 .onHover { inside in
             hover = inside

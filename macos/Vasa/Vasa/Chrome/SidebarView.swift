@@ -16,8 +16,10 @@ struct SidebarView: View {
             }
             .foregroundStyle(scheme == .dark ? Color(red: 0.62, green: 0.62, blue: 0.65) : Color(red: 0.43, green: 0.43, blue: 0.45))
             .padding(.horizontal, 8)
-            .padding(.top, 8)
-            .padding(.bottom, 8)
+            // Sidebar sits inside 10pt of padding, so 6 here puts its 28pt icon row on the
+            // same centre line as the 32pt chrome pills (14pt top inset + 16).
+            .padding(.top, 6)
+            .padding(.bottom, 10)
 
             ScrollView {
                 LazyVStack(spacing: 2) {
@@ -116,15 +118,23 @@ struct BoardRow: View {
         let hoverFill = scheme == .dark ? Color.white.opacity(0.1) : Theme.hover
         HStack(spacing: 8) {
             HStack(spacing: 8) {
-                BoardThumb(url: lesson.thumb)
-                Text(lesson.title)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(active ? Color.white : (scheme == .dark ? Color.white.opacity(0.92) : Theme.ink))
-                    .lineLimit(1)
-                Spacer(minLength: 4)
+                // The cover keeps its own taps (edges flip through the board's media,
+                // centre opens), so the row's open-tap covers only title and trailing gap.
+                BoardThumb(
+                    url: lesson.thumb,
+                    gallery: lesson.mediaSources,
+                    onOpen: { app.openLesson(lesson.id) }
+                )
+                HStack(spacing: 8) {
+                    Text(lesson.title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(active ? Color.white : (scheme == .dark ? Color.white.opacity(0.92) : Theme.ink))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { app.openLesson(lesson.id) }
             }
-            .contentShape(Rectangle())
-            .onTapGesture { app.openLesson(lesson.id) }
             Button {
                 if menuOpen {
                     app.boardMenuID = nil
@@ -172,18 +182,89 @@ struct BoardRow: View {
 
 struct BoardThumb: View {
     let url: String?
+    /// Every media source on the board, in card order — the cover can be flipped
+    /// through them from the sidebar without opening the project.
+    var gallery: [String] = []
+    /// Tapping the middle of the cover behaves like tapping the row.
+    var onOpen: (() -> Void)? = nil
     @Environment(\.colorScheme) private var scheme
+    @State private var index = 0
+    @State private var cover: NSImage?
+
+    /// Retina-sized decode for a 38x27 pt cover.
+    private let coverPixels: CGFloat = 160
+
+    private var sources: [String] {
+        var all: [String] = []
+        if let url, !url.isEmpty { all.append(url) }
+        for src in gallery where !all.contains(src) { all.append(src) }
+        return all
+    }
+
     var body: some View {
+        let sources = sources
+        let shown = sources.isEmpty ? nil : sources[min(index, sources.count - 1)]
         ZStack {
             RoundedRectangle(cornerRadius: 5)
                 .fill(scheme == .dark ? Color.white.opacity(0.08) : Color(red: 0.95, green: 0.95, blue: 0.96))
-            if let url {
-                RemoteImage(src: url).scaledToFill()
+            if let shown {
+                if shown.hasPrefix("http://") || shown.hasPrefix("https://") {
+                    RemoteImage(src: shown).scaledToFill().id(shown)
+                } else if let cover {
+                    // Decoded here rather than via RemoteImage so the previous frame stays
+                    // up until the next one is ready — swapping identity flashed the
+                    // placeholder between covers.
+                    Image(nsImage: cover)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                }
             }
         }
-        .frame(width: 32, height: 24)
+        .frame(width: 38, height: 27)
         .clipShape(RoundedRectangle(cornerRadius: 5))
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Theme.hairline(scheme)))
+        // Zones sit in an overlay on the clipped thumbnail: inside the ZStack the
+        // scaled-to-fill image blows the stack up past 38pt and the taps land offscreen.
+        .overlay {
+            HStack(spacing: 0) {
+                zone { step(-1, of: sources.count) }
+                    .frame(width: 13)
+                zone { onOpen?() }
+                zone { step(1, of: sources.count) }
+                    .frame(width: 13)
+            }
+        }
+        .onChange(of: url) { index = 0 }
+        .task(id: shown) {
+            guard let shown, !shown.hasPrefix("http") else { return }
+            if let ready = ImageMedia.cachedThumbnail(src: shown, maxPixelSize: coverPixels) {
+                cover = ready
+            } else if let loaded = await ImageMedia.loadThumbnail(src: shown, maxPixelSize: coverPixels) {
+                cover = loaded
+            }
+            // Warm the neighbours so stepping through the board is instant.
+            for offset in [1, -1] where sources.count > 1 {
+                let next = sources[((index + offset) % sources.count + sources.count) % sources.count]
+                if !next.hasPrefix("http") {
+                    await ImageMedia.prefetchThumbnail(src: next, maxPixelSize: coverPixels)
+                }
+            }
+        }
+    }
+
+    private func zone(_ action: @escaping () -> Void) -> some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .onTapGesture(perform: action)
+    }
+
+    private func step(_ delta: Int, of count: Int) {
+        guard count > 1 else {
+            onOpen?()
+            return
+        }
+        index = ((index + delta) % count + count) % count
+        AppSounds.playCanvasTap()
+        AppHaptics.perform(.levelChange)
     }
 }
 

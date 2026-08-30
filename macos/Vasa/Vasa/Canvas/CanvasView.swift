@@ -9,6 +9,13 @@ struct CanvasView: View {
     @State private var panning = false
     @State private var hostSize: CGSize = .zero
     @State private var wheelMonitor: Any?
+    /// Screen-space pointer inside the canvas — drives the eraser brush ring.
+    @State private var hoverPoint: CGPoint?
+    /// True while the system pointer is hidden for the eraser ring. Hide/unhide is
+    /// reference counted in AppKit, so this must stay balanced.
+    @State private var systemCursorHidden = false
+    /// Previous eraser sample in world space — used to interpolate a continuous band.
+    @State private var lastErasePoint: CGPoint?
 
     var body: some View {
         GeometryReader { geo in
@@ -33,6 +40,9 @@ struct CanvasView: View {
                             app.menu = nil
                         }
                     }
+                // Under the cards: the creation bloom reads as the board's own
+                // background breathing, never as an overlay on top of content.
+                ProjectWave(token: app.boardWave)
                 WorldLayer(camera: cam, ease: app.cameraEase)
                 // Under the note editor overlay — same canvas geometry + camera as cards.
                 if app.noteOpenID != nil {
@@ -46,6 +56,20 @@ struct CanvasView: View {
                         .background(Theme.selection.opacity(0.08))
                         .frame(width: marquee.width, height: marquee.height)
                         .offset(x: marquee.minX, y: marquee.minY)
+                        .allowsHitTesting(false)
+                }
+                if app.tool == .draw, let hoverPoint {
+                    // Pen gets the same ring as the eraser — thin outline at the real brush
+                    // size, drawn in the ink it paints with.
+                    let erasing = app.drawMode == .eraser
+                    let radius = (erasing ? max(6, app.drawWidth * 1.4) : max(3, app.drawWidth / 2)) * cam.zoom
+                    let ink = erasing
+                        ? Theme.primaryInk(scheme).opacity(0.55)
+                        : Theme.color(app.drawColor)
+                    Circle()
+                        .stroke(ink, lineWidth: 1)
+                        .frame(width: radius * 2, height: radius * 2)
+                        .position(hoverPoint)
                         .allowsHitTesting(false)
                 }
                 // Screen-space chrome — must sit outside WorldLayer.scaleEffect.
@@ -70,6 +94,15 @@ struct CanvasView: View {
             }
             .onDisappear {
                 if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor) }
+                setSystemCursorHidden(false)
+            }
+            // Leaving the eraser (or the draw tool) must give the pointer back even if
+            // the mouse never moves again.
+            .onChange(of: app.tool) { _, _ in
+                if app.tool != .draw { setSystemCursorHidden(false) }
+            }
+            .onChange(of: app.drawMode) { _, _ in
+                if app.tool != .draw { setSystemCursorHidden(false) }
             }
             .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers, location in
                 handleDrop(providers, at: toWorld(location, cam))
@@ -94,15 +127,20 @@ struct CanvasView: View {
     /// and its default NSTextView i-beam behavior is correct) defers to it.
     private func updateCanvasCursor(_ phase: HoverPhase, camera cam: Camera) {
         guard case .active(let point) = phase else {
+            hoverPoint = nil
+            setSystemCursorHidden(false)
             NSCursor.arrow.set()
             return
         }
+        hoverPoint = point
+        // Draw tools: the ring is the cursor, so the system pointer goes away entirely.
+        setSystemCursorHidden(app.tool == .draw)
         if app.spaceDown || panning {
             NSCursor.closedHand.set()
             return
         }
         let world = toWorld(point, cam)
-        if let hit = app.cardAt(world) {
+        if let hit = app.cardAt(world), app.tool != .draw {
             if hit.kind == .text, app.editingID == hit.id { return }
             NSCursor.arrow.set()
             return
@@ -112,6 +150,13 @@ struct CanvasView: View {
         case .text: NSCursor.iBeam.set()
         default: NSCursor.arrow.set()
         }
+    }
+
+    /// Balanced wrapper around AppKit's reference-counted cursor hiding.
+    private func setSystemCursorHidden(_ hidden: Bool) {
+        guard hidden != systemCursorHidden else { return }
+        systemCursorHidden = hidden
+        if hidden { NSCursor.hide() } else { NSCursor.unhide() }
     }
 
     private var canvasDrag: some Gesture {
@@ -150,6 +195,9 @@ struct CanvasView: View {
                     return
                 }
                 if app.tool == .draw {
+                    // `onContinuousHover` stops firing once a drag owns the pointer, which
+                    // left the brush ring parked where the stroke started.
+                    hoverPoint = value.location
                     draw(value, origin: world)
                     return
                 }
@@ -212,6 +260,7 @@ struct CanvasView: View {
                     marquee = nil
                     panning = false
                     drawingID = nil
+                    lastErasePoint = nil
                     strokeWorld = []
                     inkBaseWorld = []
                     panOrigin = nil
@@ -232,6 +281,7 @@ struct CanvasView: View {
                     marquee = nil
                     panning = false
                     drawingID = nil
+                    lastErasePoint = nil
                     strokeWorld = []
                     inkBaseWorld = []
                     panOrigin = nil
@@ -240,8 +290,12 @@ struct CanvasView: View {
                     moveOrigins = [:]
                     return
                 }
-                if drawingID != nil {
+                if let id = drawingID {
                     app.persistSoon()
+                    if inkObjectIsNew {
+                        inkObjectIsNew = false
+                        app.celebrateInk(id)
+                    }
                 } else if app.drawMode == .eraser, app.tool == .draw {
                     app.persistSoon()
                 }
@@ -271,6 +325,7 @@ struct CanvasView: View {
                 marquee = nil
                 panning = false
                 drawingID = nil
+                lastErasePoint = nil
                 strokeWorld = []
                 inkBaseWorld = []
                 panOrigin = nil
@@ -283,6 +338,8 @@ struct CanvasView: View {
     }
 
     @State private var drawingID: String?
+    /// True while the stroke in progress is the first one on a just-created ink object.
+    @State private var inkObjectIsNew = false
     /// Absolute world-space polyline for the in-progress stroke (avoids remapping churn).
     @State private var strokeWorld: [CGPoint] = []
     /// Committed strokes in world space while a pen gesture is active on a card.
@@ -301,6 +358,7 @@ struct CanvasView: View {
         if app.drawMode == .eraser {
             if drawingID == nil {
                 drawingID = "erase"
+                lastErasePoint = nil
                 app.pushUndo()
             }
             erase(at: w, width: app.drawWidth)
@@ -331,13 +389,15 @@ struct CanvasView: View {
                 )
             }
             app.pushUndo()
-            app.select([existing.id], playSound: false)
+            // Draw tool keeps the ink object unselected while stroking — Escape reveals it.
+            app.selectedIDs = []
             applyInkBounds(id: existing.id)
             return
         }
         inkBaseWorld = []
         let id = VasaID.make("c")
         drawingID = id
+        inkObjectIsNew = true
         app.activeInkCardID = id
         var card = DemoLibrary.base(id, .draw, world.x, world.y, 8, 8, 1)
         card.stroke = app.drawColorCustom ? app.drawColor : "#111318"
@@ -347,6 +407,7 @@ struct CanvasView: View {
             DrawStroke(points: [DrawPoint(x: 0, y: 0)], color: card.stroke ?? "#111318", width: app.drawWidth)
         ]
         app.addCard(card)
+        app.selectedIDs = []
         applyInkBounds(id: id)
     }
 
@@ -401,21 +462,64 @@ struct CanvasView: View {
     private func erase(at world: CGPoint, width: Double) {
         guard let lesson = app.activeLesson else { return }
         let brush = max(6, width * 1.4)
+        // Interpolate from the previous sample so a fast drag erases a continuous
+        // band instead of leaving untouched gaps between pointer events.
+        var samples: [CGPoint] = []
+        if let last = lastErasePoint, last != world {
+            let dist = hypot(world.x - last.x, world.y - last.y)
+            let steps = max(1, Int(ceil(dist / max(1, brush * 0.5))))
+            for i in 1...steps {
+                let t = Double(i) / Double(steps)
+                samples.append(CGPoint(x: last.x + (world.x - last.x) * t, y: last.y + (world.y - last.y) * t))
+            }
+        } else {
+            samples = [world]
+        }
+        lastErasePoint = world
+
+        var touched = CGRect(x: world.x, y: world.y, width: 0, height: 0)
+        for p in samples {
+            touched = touched.union(CGRect(x: p.x, y: p.y, width: 0, height: 0))
+        }
+        // Widest possible reach: brush plus half of the fattest stroke on the board.
+        let maxStroke = lesson.cards.filter { $0.kind == .draw }
+            .flatMap { $0.inkStrokes.map(\.width) }.max() ?? 0
+        let reach = brush + maxStroke * 0.5
+        touched = touched.insetBy(dx: -reach, dy: -reach)
+
         for card in lesson.cards where card.kind == .draw {
+            // Cheap reject: a card the brush cannot reach must not be rewritten —
+            // rewriting every ink card on every pointer event is what made this lag.
+            guard card.frame.intersects(touched) else { continue }
             let origin = CGPoint(x: card.x, y: card.y)
             var kept: [(points: [CGPoint], color: String, width: Double)] = []
+            var removedAny = false
             for stroke in card.inkStrokes {
-                let worldPts = stroke.points.map { CGPoint(x: origin.x + $0.x, y: origin.y + $0.y) }
-                let fragments = erasePolyline(worldPts, at: world, radius: brush + stroke.width * 0.5)
-                for frag in fragments {
+                var pieces: [[CGPoint]] = [stroke.points.map { CGPoint(x: origin.x + $0.x, y: origin.y + $0.y) }]
+                for sample in samples {
+                    var next: [[CGPoint]] = []
+                    for piece in pieces {
+                        next.append(contentsOf: erasePolyline(piece, at: sample, radius: brush + stroke.width * 0.5))
+                    }
+                    pieces = next
+                    if pieces.isEmpty { break }
+                }
+                let originalCount = stroke.points.count
+                let keptCount = pieces.reduce(0) { $0 + $1.count }
+                if keptCount != originalCount || pieces.count != 1 { removedAny = true }
+                for frag in pieces {
                     kept.append((points: frag, color: stroke.color, width: stroke.width))
                 }
             }
+            // Nothing came off this card — leave its model untouched so SwiftUI
+            // does not redraw the whole board on every mouse move.
+            guard removedAny else { continue }
             if kept.isEmpty {
                 app.patchLesson { $0.cards.removeAll { $0.id == card.id } }
                 if app.selectedIDs.contains(card.id) {
                     app.selectedIDs.removeAll { $0 == card.id }
                 }
+                if app.activeInkCardID == card.id { app.activeInkCardID = nil }
                 continue
             }
             let pad = max(4, (kept.map(\.width).max() ?? 3) / 2 + 2)
@@ -442,10 +546,8 @@ struct CanvasView: View {
         }
     }
 
-    /// Split a polyline where the eraser brush hits — never reconnect across a gap.
     private func erasePolyline(_ points: [CGPoint], at eraser: CGPoint, radius: Double) -> [[CGPoint]] {
         guard points.count >= 2 else { return [] }
-        let r2 = radius * radius
         var fragments: [[CGPoint]] = []
         var current: [CGPoint] = []
 
@@ -454,25 +556,58 @@ struct CanvasView: View {
             current = []
         }
 
-        func inside(_ p: CGPoint) -> Bool {
-            let dx = p.x - eraser.x
-            let dy = p.y - eraser.y
-            return dx * dx + dy * dy <= r2
+        func lerp(_ a: CGPoint, _ b: CGPoint, _ t: Double) -> CGPoint {
+            CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
         }
 
-        for i in 0..<points.count {
-            let p = points[i]
-            if inside(p) {
-                flush()
+        for i in 0..<(points.count - 1) {
+            let a = points[i]
+            let b = points[i + 1]
+            // Cut exactly where the brush crosses the segment. Dropping whole segments
+            // instead took away chunks far wider than the cursor actually covered.
+            guard let (t0, t1) = segmentCircleInterval(a, b, center: eraser, radius: radius) else {
+                if current.isEmpty { current.append(a) }
+                current.append(b)
                 continue
             }
-            if let prev = current.last, segmentHitsCircle(prev, p, center: eraser, radius: radius) {
-                flush()
+            if t0 > 0 {
+                if current.isEmpty { current.append(a) }
+                current.append(lerp(a, b, t0))
             }
-            current.append(p)
+            flush()
+            if t1 < 1 {
+                current = [lerp(a, b, t1), b]
+            }
         }
         flush()
         return fragments
+    }
+
+    /// Portion of `a`→`b` covered by the brush, as parameters along the segment.
+    /// Nil when the segment stays clear of the circle.
+    private func segmentCircleInterval(
+        _ a: CGPoint,
+        _ b: CGPoint,
+        center: CGPoint,
+        radius: Double
+    ) -> (Double, Double)? {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let fx = a.x - center.x
+        let fy = a.y - center.y
+        let A = dx * dx + dy * dy
+        if A < 1e-12 {
+            return (fx * fx + fy * fy <= radius * radius) ? (0, 1) : nil
+        }
+        let B = 2 * (fx * dx + fy * dy)
+        let C = fx * fx + fy * fy - radius * radius
+        let disc = B * B - 4 * A * C
+        if disc <= 0 { return nil }
+        let root = disc.squareRoot()
+        let t0 = max(0, (-B - root) / (2 * A))
+        let t1 = min(1, (-B + root) / (2 * A))
+        guard t1 > t0 else { return nil }
+        return (t0, t1)
     }
 
     private func segmentHitsCircle(_ a: CGPoint, _ b: CGPoint, center: CGPoint, radius: Double) -> Bool {
@@ -788,10 +923,14 @@ struct CanvasScreenChrome: View {
                     let h = wave.height * camera.zoom
                     let screen = toScreen(CGPoint(x: wave.x, y: wave.y), camera)
                     let field = CGRect(x: screen.x - w / 2, y: screen.y - h / 2, width: w, height: h)
+                    let step = 24 * camera.zoom
                     TextGaussianWave(
                         fieldFrame: field,
+                        cornerRadius: CGFloat(wave.cornerRadius) * camera.zoom,
                         startDate: wave.startedAt,
-                        gridStep: 24 * camera.zoom
+                        gridStep: step,
+                        gridOrigin: CanvasScreenChrome.gridPhase(camera: camera, step: step),
+                        spread: CGFloat(wave.spread)
                     ) {
                         if app.textWave?.id == wave.id { app.textWave = nil }
                     }
@@ -833,6 +972,16 @@ struct CanvasScreenChrome: View {
         }
         // Empty chrome must not eat canvas / sidebar hits.
         .allowsHitTesting(app.showsTextFormatBar || app.textWave != nil || !app.deleteWaves.isEmpty)
+    }
+
+    /// Screen-space origin of the first `DotGrid` node for the current camera.
+    static func gridPhase(camera: Camera, step: CGFloat) -> CGPoint {
+        func phase(_ v: CGFloat) -> CGFloat {
+            var r = v.truncatingRemainder(dividingBy: step)
+            if r > 0 { r -= step }
+            return r
+        }
+        return CGPoint(x: phase(camera.x), y: phase(camera.y))
     }
 
     /// Top-left of the format bar so its top edge clears the selection (or sits above if no room below).
@@ -879,22 +1028,13 @@ private struct DeleteWaveChrome: View {
         let screen = CGPoint(x: wave.x * camera.zoom + camera.x, y: wave.y * camera.zoom + camera.y)
         let field = CGRect(x: screen.x - w / 2, y: screen.y - h / 2, width: w, height: h)
         let step = 24 * camera.zoom
-        let ox: CGFloat = {
-            var v = camera.x.truncatingRemainder(dividingBy: step)
-            if v > 0 { v -= step }
-            return v
-        }()
-        let oy: CGFloat = {
-            var v = camera.y.truncatingRemainder(dividingBy: step)
-            if v > 0 { v -= step }
-            return v
-        }()
+        let origin = CanvasScreenChrome.gridPhase(camera: camera, step: step)
         return DeleteHalftoneWave(
             fieldFrame: field,
             cornerRadius: CGFloat(wave.cornerRadius) * camera.zoom,
             startDate: wave.startedAt,
             gridStep: step,
-            gridOrigin: CGPoint(x: ox, y: oy),
+            gridOrigin: origin,
             onComplete: onComplete
         )
     }
@@ -939,7 +1079,7 @@ extension AppModel {
     func cardAt(_ point: CGPoint) -> Card? {
         activeLesson?.cards
             .sorted { $0.z > $1.z }
-            .first { $0.frame.contains(point) }
+            .first { $0.hitFrame.contains(point) }
     }
 }
 

@@ -52,7 +52,6 @@
 			<string>Vasa Project</string>
 			<key>UTTypeConformsTo</key>
 			<array>
-				<string>com.apple.package</string>
 				<string>public.data</string>
 			</array>
 			<key>UTTypeTagSpecification</key>

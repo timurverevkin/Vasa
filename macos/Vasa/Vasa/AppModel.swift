@@ -92,7 +92,18 @@ final class AppModel {
     var boardMenuID: String?
     var boardMenuY: CGFloat = 56
     var boardWave = 0
+    /// Boards whose media (image/video/link/YouTube visuals) may render. A board opened
+    /// for the first time this session paints layout + text immediately and lets media
+    /// in a beat later, so a heavy project appears at once instead of stalling on
+    /// decodes. Session-lived and never cleared: reopening a board is instant, and the
+    /// staged pass never runs twice.
+    var mediaReadyLessonIDs: Set<String> = []
     var textWave: TextWaveEvent?
+    /// Card whose checkbox the pointer is currently on — that card's press gesture
+    /// stands down so ticking an item never selects (or starts dragging) the card.
+    var todoHitCardID: String?
+    /// Ink object that just took its first stroke — drives the one-shot press animation.
+    var inkPressID: String?
     /// One dissolve burst per deleted card (screen-space geometry snapshotted via world size).
     var deleteWaves: [DeleteWaveEvent] = []
     /// Alignment guides while dragging cards (cleared on drag end).
@@ -136,6 +147,12 @@ final class AppModel {
     /// scales together with the plaque (Figma/Illustrator "scale group" behavior) instead
     /// of the plaque resizing around content that stays put.
     @ObservationIgnored private var groupResizeMembers: [String: CGRect] = [:]
+    /// Ink of `.draw` members captured at group-resize start, so their strokes can be
+    /// rescaled from the original geometry instead of compounding rounding each frame.
+    @ObservationIgnored private var groupResizeMemberStrokes: [String: [DrawStroke]] = [:]
+    /// Font size of `.text` members at group-resize start — text scales with the group
+    /// like every other member instead of keeping its original size in a shrunk box.
+    @ObservationIgnored private var groupResizeMemberFonts: [String: Double] = [:]
 
     init() {
         if let saved = Persistence.load(), saved.rev == Format.libraryRev, !saved.lessons.isEmpty {
@@ -171,6 +188,15 @@ final class AppModel {
         AppSounds.isEnabled = { [weak self] in self?.settings.sounds ?? false }
         AppHaptics.isEnabled = { [weak self] in self?.settings.haptics ?? false }
         ChatKeychain.migrateLegacyDeepSeekTokenIfNeeded()
+        // The board restored from the last session is never opened through
+        // `openLesson`, so stage its media here or it would stay held back forever.
+        if let id = library.activeLessonId { stageMedia(for: id) }
+    }
+
+    /// Whether the active board may paint media yet — see `mediaReadyLessonIDs`.
+    var mediaReady: Bool {
+        guard let id = library.activeLessonId else { return true }
+        return mediaReadyLessonIDs.contains(id)
     }
 
     var activeLesson: Lesson? {
@@ -355,7 +381,38 @@ final class AppModel {
         indexDirty = true
         persistSoon()
         if playSound, switching { AppSounds.playSwipe() }
-        if switching { autoTagUntaggedCards(in: id) }
+        if switching {
+            autoTagUntaggedCards(in: id)
+            // Reopening the project already on screen shouldn't replay the bloom.
+            boardWave += 1
+        }
+        stageMedia(for: id)
+    }
+
+    /// Lets a board's media in as soon as its layout and text have had one frame to
+    /// paint — no fixed delay, just a runloop hop — then warms the thumbnail cache
+    /// concurrently. A board already staged this session skips straight through, so
+    /// its media never blinks out on reopen.
+    private func stageMedia(for id: String) {
+        guard !mediaReadyLessonIDs.contains(id) else { return }
+        let sources = (library.lessons.first { $0.id == id })?.cards
+            .compactMap { $0.poster ?? $0.src }
+            .filter { !$0.isEmpty } ?? []
+        Task { @MainActor in
+            await Task.yield()
+            mediaReadyLessonIDs.insert(id)
+        }
+        // Decodes run off the main actor and land in the shared cache, so whichever
+        // finishes first paints immediately instead of waiting on the ones before it.
+        Task.detached(priority: .userInitiated) {
+            await withTaskGroup(of: Void.self) { group in
+                for src in sources {
+                    group.addTask {
+                        await ImageMedia.prefetchThumbnail(src: src, maxPixelSize: ImageMedia.maxSide * 2)
+                    }
+                }
+            }
+        }
     }
 
     /// "August 29, 2026" — fixed English formatting regardless of system locale, so project
@@ -369,7 +426,7 @@ final class AppModel {
 
     func addLesson() {
         guard let subject = library.subjects.first else { return }
-        var lesson = Lesson(
+        let lesson = Lesson(
             id: VasaID.make("les"),
             subjectId: subject.id,
             title: Self.newProjectTitle,
@@ -384,8 +441,8 @@ final class AppModel {
         library.lessons.insert(lesson, at: 0)
         dirtyLessonIDs.insert(lesson.id)
         indexDirty = true
+        // openLesson already fires the halftone bloom.
         openLesson(lesson.id, playSound: false)
-        boardWave += 1
         AppSounds.play(.celebration)
     }
 
@@ -397,10 +454,10 @@ final class AppModel {
 
         var lastID: String?
         for url in packages {
-            // Opening a package that already lives in the library just reveals it —
+            // Opening a project that already lives in the library just reveals it —
             // re-importing would leave the user with a silent duplicate.
             if let existing = library.lessons.first(where: {
-                Persistence.lessonDirectory($0, subjects: library.subjects)
+                Persistence.libraryFile(for: $0, subjects: library.subjects)
                     .standardizedFileURL.path == url.standardizedFileURL.path
             }) {
                 lastID = existing.id
@@ -408,7 +465,7 @@ final class AppModel {
             }
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-            guard let imported = Persistence.importPackage(
+            guard let imported = Persistence.importProject(
                 at: url,
                 subjectId: subject.id,
                 subjects: library.subjects,
@@ -425,7 +482,6 @@ final class AppModel {
         indexDirty = true
         saveNow()
         openLesson(lastID, playSound: false)
-        boardWave += 1
         AppSounds.play(.celebration)
         return true
     }
@@ -484,6 +540,9 @@ final class AppModel {
     }
 
     func select(_ ids: [String], additive: Bool = false, playSound: Bool = true) {
+        // Selecting anything else ends an in-progress group rename; the plaque's own
+        // view commits the draft when it sees editing turn off.
+        if let editing = editingGroupID, !ids.contains(editing) { editingGroupID = nil }
         let next: [String] = {
             if additive { return Array(Set(selectedIDs + ids)) }
             return ids
@@ -1129,19 +1188,59 @@ final class AppModel {
         if !snapGuides.isEmpty { snapGuides = [] }
     }
 
-    /// Recolor the in-progress / selected draw card when the ink swatch changes.
-    func recolorActiveInk(_ hex: String) {
+    /// Escape while the draw tool is active reveals the ink object that was being
+    /// drawn and leaves draw mode (pen and eraser alike). Returns true when handled.
+    func handleDrawEscape() -> Bool {
+        guard tool == .draw else { return false }
         let id = activeInkCardID
-            ?? (selectedIDs.count == 1 ? selectedIDs.first : nil)
-        guard let id, let card = card(id), card.kind == .draw else { return }
-        let strokes = card.inkStrokes
-        guard !strokes.isEmpty else { return }
-        pushUndo()
-        updateCard(id) { c in
-            c.setInkStrokes(strokes.map {
-                DrawStroke(points: $0.points, color: hex, width: $0.width)
-            })
+        if let id, card(id)?.kind == .draw {
+            select([id], playSound: false)
         }
+        tool = .select
+        drawMode = .pen
+        activeInkCardID = nil
+        return true
+    }
+
+    /// First stroke on a freshly created ink object landed: same halftone wave and
+    /// paste sound a new text block gets, plus a short press-in on the object itself.
+    func celebrateInk(_ id: String) {
+        guard let card = card(id) else { return }
+        AppSounds.play(.pasteBlock)
+        let waveID = (textWave?.id ?? 0) + 1
+        textWave = TextWaveEvent(
+            id: waveID,
+            x: card.x + card.previewWidth / 2,
+            y: card.y + card.previewHeight / 2,
+            width: card.previewWidth,
+            height: card.previewHeight,
+            cornerRadius: card.dissolveCornerRadius,
+            startedAt: .now
+        )
+        inkPressID = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if self.inkPressID == id { self.inkPressID = nil }
+        }
+    }
+
+    /// A ☐/☑ was toggled inside a text card: same halftone bloom the other creation
+    /// beats use, centered on the checkbox square itself (the toggle sound already
+    /// plays from `TodoMarks.toggle`).
+    func celebrateCheckbox(cardID: String, boxRect: CGRect) {
+        guard let card = card(cardID) else { return }
+        let gap = Double(GrowingTextView.chromeGap)
+        let side = Double(max(boxRect.width, boxRect.height))
+        guard side > 0 else { return }
+        let waveID = (textWave?.id ?? 0) + 1
+        textWave = TextWaveEvent(
+            id: waveID,
+            x: card.x + gap + Double(boxRect.midX),
+            y: card.y + gap + Double(boxRect.midY),
+            width: side,
+            height: side,
+            cornerRadius: side * 0.26,
+            startedAt: .now
+        )
     }
 
     /// Screen-constant snap radius (floored so high zoom still catches edges).
@@ -1643,11 +1742,19 @@ final class AppModel {
             )
             resizingCardID = id
             if card.kind == .group, let lesson = activeLesson {
-                groupResizeMembers = Dictionary(uniqueKeysWithValues: lesson.cards
-                    .filter { $0.groupId == id }
+                let members = lesson.cards.filter { $0.groupId == id }
+                groupResizeMembers = Dictionary(uniqueKeysWithValues: members
                     .map { ($0.id, CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)) })
+                groupResizeMemberStrokes = Dictionary(uniqueKeysWithValues: members
+                    .filter { $0.kind == .draw }
+                    .map { ($0.id, $0.inkStrokes) })
+                groupResizeMemberFonts = Dictionary(uniqueKeysWithValues: members
+                    .filter { $0.kind == .text }
+                    .map { ($0.id, $0.fontSize ?? 16) })
             } else {
                 groupResizeMembers = [:]
+                groupResizeMemberStrokes = [:]
+                groupResizeMemberFonts = [:]
             }
         }
         guard let session = cardResizeSession, session.id == id else { return }
@@ -1681,7 +1788,10 @@ final class AppModel {
             return
         }
 
-        let free = NSEvent.modifierFlags.contains(.shift) || card.kind == .note || card.kind == .group
+        // A group scales proportionally, the way grouped objects behave in Keynote and
+        // Freeform: one factor for the plaque and everything inside it. Shift still opts
+        // into a free stretch, which repositions members without resizing them.
+        let free = NSEvent.modifierFlags.contains(.shift) || card.kind == .note
         if !free {
             let scale = Self.aspectScale(
                 proposedW: rawW,
@@ -1736,6 +1846,18 @@ final class AppModel {
                 }
                 return
             }
+            if card.kind == .group, !groupResizeMembers.isEmpty {
+                var uniform = width / max(session.width, 1)
+                // Floor the factor so the plaque cannot shrink past what its smallest
+                // member can legibly show.
+                let memberFloor: Double = 64
+                for origin in groupResizeMembers.values {
+                    uniform = max(uniform, memberFloor / max(min(origin.width, origin.height), 1))
+                }
+                width = session.width * uniform
+                height = session.height * uniform
+                scaleGroupMembers(groupOrigin: CGPoint(x: card.x, y: card.y), factor: uniform)
+            }
             updateCard(id, persist: false) {
                 $0.width = width
                 $0.height = height
@@ -1763,34 +1885,47 @@ final class AppModel {
         }
         snapGuides = freeGuides
         if card.kind == .group, !groupResizeMembers.isEmpty {
-            // Floor the scale itself (not just each member's output size) so the plaque
-            // can't keep shrinking past what its smallest member can legibly show — that
-            // mismatch is what let the frame and its members drift out of sync and produced
-            // the distorted/overflowing layout when a group was squeezed too far.
-            let memberFloor: Double = 64
-            var minSx = 0.0, minSy = 0.0
-            for origin in groupResizeMembers.values {
-                minSx = max(minSx, memberFloor / max(origin.width, 1))
-                minSy = max(minSy, memberFloor / max(origin.height, 1))
-            }
-            var sx = freeW / max(session.width, 1)
-            var sy = freeH / max(session.height, 1)
-            sx = max(sx, minSx)
-            sy = max(sy, minSy)
-            freeW = session.width * sx
-            freeH = session.height * sy
+            // Shift-stretch: the plaque changes shape, members keep their own size and
+            // only follow the frame, so nothing inside is ever distorted.
+            let sx = freeW / max(session.width, 1)
+            let sy = freeH / max(session.height, 1)
             for (memberID, origin) in groupResizeMembers {
                 updateCard(memberID, persist: false) {
                     $0.x = card.x + (origin.minX - card.x) * sx
                     $0.y = card.y + (origin.minY - card.y) * sy
-                    $0.width = origin.width * sx
-                    $0.height = origin.height * sy
                 }
             }
         }
         updateCard(id, persist: false) {
             $0.width = freeW
             $0.height = freeH
+        }
+    }
+
+    /// Scales every captured group member — position, size, ink and text alike — by one
+    /// factor, so the group's contents keep their proportions and their relative layout.
+    private func scaleGroupMembers(groupOrigin: CGPoint, factor: Double) {
+        for (memberID, origin) in groupResizeMembers {
+            let strokes = groupResizeMemberStrokes[memberID]
+            let font = groupResizeMemberFonts[memberID]
+            updateCard(memberID, persist: false) {
+                $0.x = groupOrigin.x + (origin.minX - groupOrigin.x) * factor
+                $0.y = groupOrigin.y + (origin.minY - groupOrigin.y) * factor
+                $0.width = origin.width * factor
+                $0.height = origin.height * factor
+                if let strokes {
+                    $0.setInkStrokes(strokes.map { stroke in
+                        DrawStroke(
+                            points: stroke.points.map { DrawPoint(x: $0.x * factor, y: $0.y * factor) },
+                            color: stroke.color,
+                            width: max(1, stroke.width * factor)
+                        )
+                    })
+                }
+                if let font {
+                    $0.fontSize = min(200, max(8, (font * factor * 10).rounded() / 10))
+                }
+            }
         }
     }
 
@@ -1818,6 +1953,8 @@ final class AppModel {
         cardResizeSession = nil
         resizingCardID = nil
         groupResizeMembers = [:]
+        groupResizeMemberStrokes = [:]
+        groupResizeMemberFonts = [:]
         clearSnapGuides()
     }
 
@@ -1825,17 +1962,15 @@ final class AppModel {
         resizingCardID == id
     }
 
-    /// Exports a project as a `.vasa` package — the same self-contained layout the app
-    /// already stores on disk (`board.json` + `media/`), so the copy carries its images,
-    /// audio and video with it. The previous implementation wrote a bare `board.json`,
-    /// whose media paths are relative to a `media/` folder that was never included.
+    /// Exports a project as a `.vasa` file — a single self-contained document holding
+    /// the board and all of its media, so it attaches to mail and chat as one file.
     func exportLesson(_ id: String) {
         guard library.lessons.contains(where: { $0.id == id }) else { return }
-        // The package on disk is what gets copied, so pending edits must land first.
-        // Re-read afterwards: saving is what assigns `path` to a project that never had one.
+        // Flush first: the archive in the library is what gets copied, and saving is
+        // also what assigns `path` to a project that never had one.
         saveNow()
         guard let lesson = library.lessons.first(where: { $0.id == id }) else { return }
-        let source = Persistence.lessonDirectory(lesson, subjects: library.subjects)
+        let source = Persistence.libraryFile(for: lesson, subjects: library.subjects)
         guard FileManager.default.fileExists(atPath: source.path) else { return }
 
         let panel = NSSavePanel()
@@ -2785,6 +2920,17 @@ final class AppModel {
         persistSoon()
     }
 
+    /// Space / "Preview" on a video card. The lightbox only shows a picture until a
+    /// player exists — with none loaded yet it fell back to the poster, which is empty
+    /// for most clips and read as a grey screen. Start playback first, then present.
+    func openVideoPreview(_ card: Card) {
+        guard card.kind == .video else { return }
+        if playingID != card.id || Playback.shared.videoPlayer == nil {
+            setPlaying(card.id)
+        }
+        lightbox = LightboxItem(src: card.poster ?? "", alt: card.title, videoSrc: card.src)
+    }
+
     func setPlaying(_ id: String?) {
         if id == nil {
             Playback.shared.stop()
@@ -3007,6 +3153,7 @@ final class AppModel {
             y: origin.y + size.height / 2,
             width: size.width,
             height: size.height,
+            cornerRadius: card.dissolveCornerRadius,
             startedAt: .now
         )
     }
@@ -3672,6 +3819,7 @@ final class AppModel {
             y: point.y + card.height / 2,
             width: card.width,
             height: card.height,
+            cornerRadius: card.dissolveCornerRadius,
             startedAt: .now
         )
     }
